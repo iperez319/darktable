@@ -274,6 +274,18 @@ typedef struct dt_dev_pixelpipe_t
   size_t mask_cache_size;
 } dt_dev_pixelpipe_t;
 
+/** An owned, stable copy of a completed 8-bit screen-pipe backbuffer. */
+typedef struct dt_dev_backbuffer_snapshot_t
+{
+  uint8_t *data;
+  size_t size;
+  int width;
+  int height;
+  float scale;
+  dt_dev_zoom_pos_t zoom_pos;
+  dt_hash_t hash;
+} dt_dev_backbuffer_snapshot_t;
+
 struct dt_develop_t;
 
 static inline gboolean dt_pipe_is_fast(const dt_dev_pixelpipe_t *pipe)
@@ -401,6 +413,15 @@ void dt_dev_pixelpipe_get_dimensions(dt_dev_pixelpipe_t *pipe,
 
 // destroys all allocated data.
 void dt_dev_pixelpipe_cleanup(dt_dev_pixelpipe_t *pipe);
+
+/**
+ * Copy the visible 8-bit screen backbuffer while holding its mutex. The caller
+ * owns snapshot->data and releases it with g_free(). On failure snapshot is
+ * zeroed and error, when non-NULL, receives an allocated diagnostic string.
+ */
+gboolean dt_dev_pixelpipe_backbuffer_snapshot(dt_dev_pixelpipe_t *pipe,
+                                               dt_dev_backbuffer_snapshot_t *snapshot,
+                                               char **error);
 
 // wrapper for cleanup_nodes, create_nodes, synch_all and synch_top,
 // decides upon changed event which one to take on. also locks

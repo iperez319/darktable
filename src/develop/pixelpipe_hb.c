@@ -449,6 +449,70 @@ void dt_dev_pixelpipe_cleanup(dt_dev_pixelpipe_t *pipe)
   dt_pthread_mutex_destroy(&pipe->mutex);
 }
 
+gboolean dt_dev_pixelpipe_backbuffer_snapshot(dt_dev_pixelpipe_t *pipe,
+                                               dt_dev_backbuffer_snapshot_t *snapshot,
+                                               char **error)
+{
+  if(error) *error = NULL;
+  if(!snapshot)
+  {
+    if(error) *error = g_strdup("missing snapshot destination");
+    return FALSE;
+  }
+  memset(snapshot, 0, sizeof(*snapshot));
+  if(!pipe)
+  {
+    if(error) *error = g_strdup("missing pixelpipe");
+    return FALSE;
+  }
+
+  gboolean ok = FALSE;
+  dt_pthread_mutex_lock(&pipe->backbuf_mutex);
+  const int width = pipe->backbuf_width;
+  const int height = pipe->backbuf_height;
+  size_t pixels = 0;
+  size_t bytes = 0;
+  if(pipe->status != DT_DEV_PIXELPIPE_VALID)
+  {
+    if(error) *error = g_strdup("pixelpipe is not valid");
+  }
+  else if(!dt_pipe_is_screen(pipe) || (pipe->type & DT_DEV_PIXELPIPE_IMAGE_FLOAT))
+  {
+    if(error) *error = g_strdup("pixelpipe is not an 8-bit screen pipe");
+  }
+  else if(!pipe->backbuf || width <= 0 || height <= 0)
+  {
+    if(error) *error = g_strdup("pixelpipe has no completed backbuffer");
+  }
+  else if((size_t)width > G_MAXSIZE / (size_t)height
+          || (pixels = (size_t)width * (size_t)height) > G_MAXSIZE / 4
+          || (bytes = pixels * 4) != pipe->backbuf_size)
+  {
+    if(error) *error = g_strdup("pixelpipe backbuffer dimensions are inconsistent");
+  }
+  else
+  {
+    snapshot->data = g_try_malloc(bytes);
+    if(!snapshot->data)
+    {
+      if(error) *error = g_strdup("could not allocate backbuffer snapshot");
+    }
+    else
+    {
+      memcpy(snapshot->data, pipe->backbuf, bytes);
+      snapshot->size = bytes;
+      snapshot->width = width;
+      snapshot->height = height;
+      snapshot->scale = pipe->backbuf_scale;
+      memcpy(snapshot->zoom_pos, pipe->backbuf_zoom_pos, sizeof(snapshot->zoom_pos));
+      snapshot->hash = pipe->backbuf_hash;
+      ok = TRUE;
+    }
+  }
+  dt_pthread_mutex_unlock(&pipe->backbuf_mutex);
+  return ok;
+}
+
 void dt_dev_pixelpipe_cleanup_nodes(dt_dev_pixelpipe_t *pipe)
 {
   // tell pipe that it should shut itself down if currently running

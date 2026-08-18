@@ -1113,6 +1113,11 @@ if(USE_MCP)
   add_subdirectory(mcp)
 endif()
 
+# persistent, pipe-framed engine used by the remote editing prototype
+if(USE_REMOTE_WORKER)
+  add_subdirectory(remote)
+endif()
+
 # have a command line utility to generate all the thumbnails
 add_subdirectory(generate-cache)
 
