@@ -160,6 +160,19 @@ typedef struct dt_dev_detail_mask_t
 } dt_dev_detail_mask_t;
 
 /**
+ * Optional, synchronous access to the host float buffer immediately before
+ * the terminal gamma module packs a screen-pipe result. The callback may read
+ * the pixels only for the duration of the call and must not retain them.
+ */
+typedef void (*dt_dev_pixelpipe_analysis_callback_t)(
+    void *user_data,
+    const float *input,
+    int width,
+    int height,
+    dt_iop_colorspace_type_t colorspace,
+    const struct dt_iop_order_iccprofile_info_t *profile_info);
+
+/**
  * this encapsulates the pixelpipe.
  * a develop module will need several of these:
  * for previews and full blits to cairo and for
@@ -272,6 +285,10 @@ typedef struct dt_dev_pixelpipe_t
   size_t mask_distort_buf_size[2];
   // sum of all per-piece detail/raster mask caches currently allocated in this pipe
   size_t mask_cache_size;
+
+  // Optional GUI-neutral analysis tap at the pre-gamma host-buffer boundary.
+  dt_dev_pixelpipe_analysis_callback_t analysis_callback;
+  void *analysis_user_data;
 } dt_dev_pixelpipe_t;
 
 /** An owned, stable copy of a completed 8-bit screen-pipe backbuffer. */

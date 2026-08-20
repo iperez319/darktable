@@ -120,6 +120,30 @@ static JsonObject *_values_object(float exposure_ev, float black)
   return values;
 }
 
+static JsonArray *_histogram_channel(const uint32_t *counts)
+{
+  JsonArray *channel = json_array_sized_new(DT_REMOTE_HISTOGRAM_BINS);
+  for(size_t bin = 0; bin < DT_REMOTE_HISTOGRAM_BINS; bin++)
+    json_array_add_int_element(channel, counts[bin]);
+  return channel;
+}
+
+static JsonObject *_histogram_object(const dt_remote_analysis_t *analysis)
+{
+  JsonObject *histogram = json_object_new();
+  json_object_set_string_member(histogram, "domain", DT_REMOTE_HISTOGRAM_DOMAIN);
+  json_object_set_int_member(histogram, "bins", DT_REMOTE_HISTOGRAM_BINS);
+  json_object_set_string_member(histogram, "channels", "rgb");
+  json_object_set_array_member(histogram, "red", _histogram_channel(analysis->red));
+  json_object_set_array_member(histogram, "green", _histogram_channel(analysis->green));
+  json_object_set_array_member(histogram, "blue", _histogram_channel(analysis->blue));
+  json_object_set_int_member(histogram, "sampledPixels", analysis->sampled_pixels);
+  json_object_set_int_member(histogram, "sourceGeneration", (gint64)analysis->generation);
+  json_object_set_string_member(histogram, "sourcePixelpipeResultDigest",
+                                analysis->pixelpipe_result_digest);
+  return histogram;
+}
+
 static JsonNode *_capabilities(JsonObject *request)
 {
   JsonObject *body = json_object_new();
@@ -140,7 +164,9 @@ static JsonNode *_capabilities(JsonObject *request)
   JsonArray *surfaces = json_array_new();
   json_array_add_string_element(surfaces, "srgb-sdr-surface-v1");
   json_object_set_array_member(body, "surfaceContracts", surfaces);
-  json_object_set_array_member(body, "histogramDomains", json_array_new());
+  JsonArray *histogram_domains = json_array_new();
+  json_array_add_string_element(histogram_domains, DT_REMOTE_HISTOGRAM_DOMAIN);
+  json_object_set_array_member(body, "histogramDomains", histogram_domains);
   return _envelope(request, "worker.capabilities", body);
 }
 
@@ -299,19 +325,21 @@ static gboolean _handle(FILE *output, dt_remote_session_t *session, const dt_rem
     json_object_set_int_member(response, "generation", (gint64)generation);
     json_object_set_string_member(response, "stateDigest", session->state_digest);
     json_object_set_string_member(response, "moduleStackDigest", session->state_digest);
-    json_object_set_string_member(response, "pixelpipeResultDigest", surface.pixel_digest);
+    json_object_set_string_member(response, "pixelpipeResultDigest",
+                                  session->analysis.pixelpipe_result_digest);
     json_object_set_int_member(response, "width", surface.width);
     json_object_set_int_member(response, "height", surface.height);
     json_object_set_int_member(response, "bytesPerRow", surface.bytes_per_row);
     json_object_set_int_member(response, "payloadBytes", (gint64)surface.size);
     json_object_set_string_member(response, "pixelFormat", "bgra8Unorm");
     json_object_set_string_member(response, "pixelDigest", surface.pixel_digest);
-    json_object_set_null_member(response, "histogram");
+    json_object_set_object_member(response, "histogram",
+                                  _histogram_object(&session->analysis));
     JsonObject *timing = json_object_new();
     json_object_set_double_member(timing, "apply", 0.0);
     json_object_set_double_member(timing, "pixelpipe", pixelpipe_ms);
     json_object_set_double_member(timing, "surfaceCopy", MAX(0.0, total_ms - pixelpipe_ms));
-    json_object_set_double_member(timing, "histogram", 0.0);
+    json_object_set_double_member(timing, "histogram", session->analysis.elapsed_ms);
     json_object_set_object_member(response, "timingMs", timing);
     JsonNode *node = _envelope(request, "surface.rendered", response);
     const gboolean sent =

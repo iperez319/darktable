@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include "remote/remote_analysis.h"
 #include "remote/remote_exposure.h"
 #include "remote/remote_surface.h"
 
@@ -18,6 +19,7 @@ typedef struct dt_remote_session_t
   dt_imgid_t image_id;
   dt_develop_t dev;
   dt_remote_exposure_t exposure;
+  dt_remote_analysis_t analysis;
   GMutex mutex;
   gboolean initialized;
   gboolean open;

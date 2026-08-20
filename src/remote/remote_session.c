@@ -111,6 +111,8 @@ void dt_remote_session_cleanup(dt_remote_session_t *session)
   g_mutex_lock(&session->mutex);
   if(session->open)
   {
+    session->dev.full.pipe->analysis_callback = NULL;
+    session->dev.full.pipe->analysis_user_data = NULL;
     dt_remote_exposure_cleanup(&session->exposure);
     dt_dev_cleanup(&session->dev);
     if(dt_is_valid_imgid(session->image_id))
@@ -192,6 +194,8 @@ gboolean dt_remote_session_open(dt_remote_session_t *session, const char *image_
   dt_dev_load_image(&session->dev, session->image_id);
   if(!dt_remote_exposure_init(&session->exposure, &session->dev, error))
     goto failed_dev;
+  session->dev.full.pipe->analysis_callback = dt_remote_analysis_callback;
+  session->dev.full.pipe->analysis_user_data = &session->analysis;
 
   session->maximum_long_edge = maximum_long_edge;
   session->epoch = (((uint64_t)g_get_real_time()) << 1) ^ (uint64_t)g_random_int();
@@ -311,12 +315,21 @@ static gboolean _render_unlocked(dt_remote_session_t *session, uint64_t revision
   session->dev.full.height = (int)height;
   session->dev.full.pipe->changed |= DT_DEV_PIPE_ZOOMED;
   dt_dev_invalidate_all(&session->dev);
+  dt_remote_analysis_prepare(&session->analysis, revision, generation);
   const gint64 start = g_get_monotonic_time();
   dt_dev_process_image_job(&session->dev, &session->dev.full, session->dev.full.pipe,
                            (dt_signal_t)-1, session->dev.full.pipe->devid);
   if(render_ms)
     *render_ms = (double)(g_get_monotonic_time() - start) / 1000.0;
-  return dt_remote_surface_from_pipe(session->dev.full.pipe, surface, error);
+  if(!dt_remote_surface_from_pipe(session->dev.full.pipe, surface, error))
+    return FALSE;
+  if(!dt_remote_analysis_finalize(&session->analysis, session->state_digest,
+                                  surface->pixel_digest, surface->width, surface->height, error))
+  {
+    dt_remote_surface_clear(surface);
+    return FALSE;
+  }
+  return TRUE;
 }
 
 gboolean dt_remote_session_render(dt_remote_session_t *session, uint64_t revision,

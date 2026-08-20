@@ -8,6 +8,7 @@ add_executable(darktable-remote-worker
   remote_protocol.c
   remote_session.c
   remote_exposure.c
+  remote_analysis.c
   remote_surface.c)
 
 set_target_properties(darktable-remote-worker PROPERTIES LINKER_LANGUAGE C)

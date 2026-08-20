@@ -110,7 +110,13 @@ def process_rss_mib(pid: int) -> float | None:
         return None
 
 
-def validate_surface(message: dict, pixels: bytes, generation: int, revision: int) -> None:
+def validate_surface(
+    message: dict,
+    pixels: bytes,
+    generation: int,
+    revision: int,
+    require_histogram_edge_bins: bool,
+) -> str:
     body = message["body"]
     width = int(body["width"])
     height = int(body["height"])
@@ -126,6 +132,47 @@ def validate_surface(message: dict, pixels: bytes, generation: int, revision: in
         raise RuntimeError("surface SHA-256 mismatch")
     if pixels[3::4] != b"\xff" * (len(pixels) // 4):
         raise RuntimeError("surface contains non-opaque alpha")
+
+    result_digest = body.get("pixelpipeResultDigest", "")
+    if not (
+        isinstance(result_digest, str)
+        and result_digest.startswith("sha256:")
+        and len(result_digest) == 71
+    ):
+        raise RuntimeError("surface has an invalid pixelpipe result digest")
+    histogram = body.get("histogram")
+    if not isinstance(histogram, dict):
+        raise RuntimeError("surface is missing its coherent histogram")
+    if (
+        histogram.get("domain") != "display-referred-float-pre-pack-v1"
+        or histogram.get("bins") != 1024
+        or histogram.get("channels") != "rgb"
+        or histogram.get("sourceGeneration") != generation
+        or histogram.get("sourcePixelpipeResultDigest") != result_digest
+    ):
+        raise RuntimeError("histogram contract or source binding is invalid")
+    sampled_pixels = int(histogram.get("sampledPixels", -1))
+    if sampled_pixels != width * height:
+        raise RuntimeError("histogram sampled-pixel count does not match the surface")
+    channels: list[list[int]] = []
+    for name in ("red", "green", "blue"):
+        channel = histogram.get(name)
+        if (
+            not isinstance(channel, list)
+            or len(channel) != 1024
+            or any(not isinstance(value, int) or value < 0 for value in channel)
+        ):
+            raise RuntimeError(f"histogram {name} channel is invalid")
+        if sum(channel) != sampled_pixels:
+            raise RuntimeError(f"histogram {name} total does not match sampled pixels")
+        channels.append(channel)
+    edge_total = sum(channel[0] + channel[-1] for channel in channels)
+    if require_histogram_edge_bins and edge_total == 0:
+        raise RuntimeError("histogram edge-bin fixture produced no edge samples")
+    encoded_counts = b"".join(
+        struct.pack(">I", value) for channel in channels for value in channel
+    )
+    return hashlib.sha256(encoded_counts).hexdigest()
 
 
 def rgb_sha256(pixels: bytes) -> str:
@@ -172,6 +219,10 @@ def run(args: argparse.Namespace) -> int:
             capabilities, attachment = read_frame(process.stdout, CAPABILITIES)
             if attachment or capabilities["body"]["protocolMajor"] != 1:
                 raise RuntimeError("invalid worker capabilities response")
+            if capabilities["body"].get("histogramDomains") != [
+                "display-referred-float-pre-pack-v1"
+            ]:
+                raise RuntimeError("worker does not advertise the WP3 histogram domain")
             if (
                 args.expected_commit
                 and capabilities["body"].get("darktableCommit") != args.expected_commit
@@ -204,6 +255,7 @@ def run(args: argparse.Namespace) -> int:
             baseline_rss = process_rss_mib(process.pid)
             maximum_rss = baseline_rss
             repeated_state_digests: dict[float, str] = {}
+            repeated_histogram_digests: dict[float, str] = {}
 
             # An invalid mutation must not advance either revision or generation.
             request_id = str(uuid.uuid4())
@@ -269,7 +321,20 @@ def run(args: argparse.Namespace) -> int:
                     ),
                 )
                 rendered, pixels = read_frame(process.stdout, RENDERED)
-                validate_surface(rendered, pixels, generation, revision)
+                histogram_digest = validate_surface(
+                    rendered,
+                    pixels,
+                    generation,
+                    revision,
+                    args.require_histogram_edge_bins,
+                )
+                previous_histogram = repeated_histogram_digests.setdefault(
+                    exposure, histogram_digest
+                )
+                if histogram_digest != previous_histogram:
+                    raise RuntimeError(
+                        "identical exposure states produced different histograms"
+                    )
                 if index == 0 and args.expected_first_rgb_sha256:
                     actual_rgb_digest = rgb_sha256(pixels)
                     if actual_rgb_digest != args.expected_first_rgb_sha256:
@@ -385,6 +450,11 @@ def parse_args() -> argparse.Namespace:
         help="optional decoded-RGB SHA-256 for the first (low-EV) surface",
     )
     parser.add_argument("--expected-commit", help="optional exact 40-hex worker source commit")
+    parser.add_argument(
+        "--require-histogram-edge-bins",
+        action="store_true",
+        help="require the test image/state to exercise histogram bins 0 or 1023",
+    )
     parser.add_argument("--verbose-worker", action="store_true")
     args = parser.parse_args()
     if args.edits < 1:

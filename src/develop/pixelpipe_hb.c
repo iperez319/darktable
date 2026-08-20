@@ -316,6 +316,8 @@ gboolean dt_dev_pixelpipe_init_cached(dt_dev_pixelpipe_t *pipe,
   memset(pipe->mask_distort_buf, 0, sizeof(pipe->mask_distort_buf));
   memset(pipe->mask_distort_buf_size, 0, sizeof(pipe->mask_distort_buf_size));
   pipe->mask_cache_size = 0;
+  pipe->analysis_callback = NULL;
+  pipe->analysis_user_data = NULL;
   return dt_dev_pixelpipe_cache_init(pipe, entries, size, fraction);
 }
 
@@ -2062,10 +2064,19 @@ static gboolean _dev_pixelpipe_process_rec(dt_dev_pixelpipe_t *pipe,
     && module
     && dt_iop_module_is_gamma(module);
 
+  // The analysis callback consumes gamma's input, which is unavailable from
+  // a terminal cache hit. Keep the existing cache behavior for every pipe
+  // that has no callback installed.
+  const gboolean gamma_analysis =
+    pipe->analysis_callback
+    && module
+    && dt_iop_module_is_gamma(module);
+
   // we also never want any cached data if in masking mode or nocache is active
   // otherwise we check for a valid cacheline
   const gboolean cache_available =
       !gamma_preview
+      && !gamma_analysis
       && dt_pipe_no_mask_display(pipe)
       && !pipe->nocache
       && dt_dev_pixelpipe_cache_available(pipe, hash, bufsize);
@@ -3211,7 +3222,17 @@ static gboolean _dev_pixelpipe_process_rec(dt_dev_pixelpipe_t *pipe,
       dt_free_align(analyse);
   }
 
-  // 4) colorpicker and scopes:
+  // 4) optional GUI-neutral analysis, colorpicker and scopes:
+  if(pipe->analysis_callback
+     && dt_iop_module_is_gamma(module)
+     && input)
+  {
+    pipe->analysis_callback(pipe->analysis_user_data, input,
+                            roi_in.width, roi_in.height,
+                            (*out_format)->cst,
+                            dt_ioppr_get_pipe_output_profile_info(pipe));
+  }
+
   if(dev->gui_attached
       && !dev->gui_leaving
       && pipe == dev->preview_pipe

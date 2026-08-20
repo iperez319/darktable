@@ -5,7 +5,7 @@ Exposure + Histogram MVP. It has no listener. A trusted gateway owns the child
 process and exchanges the frozen `DTRW` v1 frames over stdin/stdout; diagnostics
 go only to stderr.
 
-WP2 provides:
+WP2 and WP3 provide:
 
 - one in-memory image import and one persistent `dt_develop_t` with full,
   preview, and preview2 pipes;
@@ -14,11 +14,16 @@ WP2 provides:
 - serialized revision/generation mutation and rendering;
 - checked, mutex-protected backbuffer snapshots normalized to tight, top-first,
   opaque BGRA8 attachments with SHA-256 integrity;
+- a GUI-neutral callback over the final host float buffer before gamma packing,
+  with a 1,024-bin RGB histogram computed by `dt_histogram_helper`;
+- retry-safe histogram replacement plus revision, generation, profile, sampled
+  pixel, timing, and pixelpipe-result-digest binding;
 - exact framed reads/writes and frozen input/allocation limits.
 
-The `histogram` member of `surface.rendered` is `null` in WP2 and the worker
-advertises no histogram domain. WP3 installs the coherent pre-gamma tap and
-populates that member without changing the v1 framing.
+`surface.rendered.histogram` uses the frozen
+`display-referred-float-pre-pack-v1` domain. Its RGB arrays each contain 1,024
+bins and sum to `sampledPixels`. The histogram and raw surface share the outer
+revision/generation and the same `pixelpipeResultDigest`; framing is unchanged.
 
 ## Build
 
@@ -33,13 +38,15 @@ The option defaults to `OFF`. The executable injects `--library :memory:` and
 
 ## Stability harness
 
-The harness defaults to the WP2 exit test: 1,000 alternating exposure edits,
-each followed by a verified raw surface, in one worker process. It checks frame
-limits, dimensions, ordering metadata, pixel SHA-256, opaque alpha, and bounded
-RSS. It also proves that a rejected out-of-range mutation changes neither the
-revision nor the generation by successfully reusing that generation afterward,
-checks deterministic repeated-state digests and Exposure-driven Black coupling,
-and verifies that reset restores the complete baseline blob digest.
+The harness defaults to the persistent-worker exit test: 1,000 alternating
+exposure edits, each followed by a verified raw surface, in one worker process.
+It checks frame limits, dimensions, ordering metadata, pixel SHA-256, opaque
+alpha, histogram shape/totals/source binding, deterministic repeated-state
+histograms, and bounded RSS. It also proves that a rejected out-of-range
+mutation changes neither the revision nor the generation by successfully
+reusing that generation afterward, checks deterministic repeated-state digests
+and Exposure-driven Black coupling, and verifies that reset restores the
+complete baseline blob digest.
 
 ```sh
 python3 src/remote/worker_harness.py \
@@ -49,7 +56,8 @@ python3 src/remote/worker_harness.py \
 
 Use `--edits 3` for a quick smoke test. The default 256-pixel canvas keeps the
 stability run focused on lifecycle and allocation behavior rather than final
-2048-pixel latency.
+2048-pixel latency. Pass `--require-histogram-edge-bins` with the committed
+synthetic chart to exercise bins 0 and 1023 explicitly.
 
 For a full-size parity check, pass the WP1 decoded-RGB digest for the first
 (`--low-ev`) surface with `--expected-first-rgb-sha256`. Use
