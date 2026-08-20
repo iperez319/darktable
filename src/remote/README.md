@@ -29,8 +29,14 @@ revision/generation and the same `pixelpipeResultDigest`; framing is unchanged.
 
 ```sh
 cmake -B build -DUSE_REMOTE_WORKER=ON -DUSE_MCP=ON
-cmake --build build --target darktable-remote-worker
+cmake --build build --parallel
 ```
+
+Building only the `darktable-remote-worker` target is sufficient as a compile
+and link check, but it does not stage the complete runtime tree. A worker run
+directly from the build directory also needs the RawSpeed camera database and
+the loadable image-operation modules (including Exposure), so build the default
+target set before running the harness or gateway.
 
 The option defaults to `OFF`. The executable injects `--library :memory:` and
 `--conf write_sidecar_files=never` unless those core options are supplied after
