@@ -8,10 +8,12 @@ import hashlib
 import json
 import os
 import resource
+import statistics
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -183,6 +185,15 @@ def rgb_sha256(pixels: bytes) -> str:
     return hashlib.sha256(rgb).hexdigest()
 
 
+def percentile(samples: list[float], fraction: float) -> float:
+    """Return a nearest-rank percentile without requiring a third-party package."""
+    if not samples:
+        return 0.0
+    ordered = sorted(samples)
+    rank = max(0, min(len(ordered) - 1, int((len(ordered) - 1) * fraction + 0.5)))
+    return ordered[rank]
+
+
 def run(args: argparse.Namespace) -> int:
     worker = Path(args.worker).resolve()
     image = Path(args.image).resolve()
@@ -192,6 +203,8 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError(f"image is not a regular file: {image}")
     if args.width > args.max_long_edge or args.height > args.max_long_edge:
         raise ValueError("render dimensions exceed --max-long-edge")
+    with image.open("rb") as image_stream:
+        image_digest = hashlib.file_digest(image_stream, "sha256").hexdigest()
 
     with tempfile.TemporaryDirectory(prefix="darktable-remote-harness.") as temporary:
         root = Path(temporary)
@@ -219,6 +232,7 @@ def run(args: argparse.Namespace) -> int:
             capabilities, attachment = read_frame(process.stdout, CAPABILITIES)
             if attachment or capabilities["body"]["protocolMajor"] != 1:
                 raise RuntimeError("invalid worker capabilities response")
+            worker_capabilities = capabilities["body"]
             if capabilities["body"].get("histogramDomains") != [
                 "display-referred-float-pre-pack-v1"
             ]:
@@ -254,8 +268,14 @@ def run(args: argparse.Namespace) -> int:
             baseline_digest = opened["body"]["stateDigest"]
             baseline_rss = process_rss_mib(process.pid)
             maximum_rss = baseline_rss
+            rss_samples = [] if baseline_rss is None else [{"edit": 0, "rssMiB": baseline_rss}]
             repeated_state_digests: dict[float, str] = {}
             repeated_histogram_digests: dict[float, str] = {}
+            round_trip_samples: list[float] = []
+            pixelpipe_samples: list[float] = []
+            histogram_samples: list[float] = []
+            surface_copy_samples: list[float] = []
+            rss_sample_count = 1 if baseline_rss is not None else 0
 
             # An invalid mutation must not advance either revision or generation.
             request_id = str(uuid.uuid4())
@@ -277,6 +297,7 @@ def run(args: argparse.Namespace) -> int:
             read_error(process.stdout, "invalid_exposure")
 
             for index in range(args.edits):
+                round_trip_start = time.monotonic_ns()
                 generation = index + 1
                 exposure = args.low_ev if index % 2 == 0 else args.high_ev
                 request_id = str(uuid.uuid4())
@@ -321,6 +342,7 @@ def run(args: argparse.Namespace) -> int:
                     ),
                 )
                 rendered, pixels = read_frame(process.stdout, RENDERED)
+                round_trip_samples.append((time.monotonic_ns() - round_trip_start) / 1_000_000.0)
                 histogram_digest = validate_surface(
                     rendered,
                     pixels,
@@ -342,9 +364,16 @@ def run(args: argparse.Namespace) -> int:
                             "first worker surface does not match the expected decoded-RGB digest: "
                             f"{actual_rgb_digest}"
                         )
-                rss = process_rss_mib(process.pid)
-                if rss is not None:
-                    maximum_rss = rss if maximum_rss is None else max(maximum_rss, rss)
+                timing = rendered["body"].get("timingMs", {})
+                pixelpipe_samples.append(float(timing.get("pixelpipe", 0.0)))
+                histogram_samples.append(float(timing.get("histogram", 0.0)))
+                surface_copy_samples.append(float(timing.get("surfaceCopy", 0.0)))
+                if index % args.rss_sample_interval == 0 or index + 1 == args.edits:
+                    rss = process_rss_mib(process.pid)
+                    if rss is not None:
+                        rss_sample_count += 1
+                        maximum_rss = rss if maximum_rss is None else max(maximum_rss, rss)
+                        rss_samples.append({"edit": index + 1, "rssMiB": rss})
 
             # Exercise the desktop-compatible coupling rule, then prove full-blob reset
             # restores the original deterministic digest (including hidden fields).
@@ -408,24 +437,85 @@ def run(args: argparse.Namespace) -> int:
                 raise RuntimeError(f"worker exited with status {return_code}")
             peak_raw = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
             peak_rss = peak_raw / (1024.0 * 1024.0) if sys.platform == "darwin" else peak_raw / 1024.0
+            limit_failures = []
             if peak_rss > args.max_rss_mib:
-                raise RuntimeError(
+                limit_failures.append(
                     f"peak worker RSS was {peak_rss:.1f} MiB, over the {args.max_rss_mib:.1f} MiB limit"
                 )
             growth = None
             if baseline_rss is not None and maximum_rss is not None:
                 growth = maximum_rss - baseline_rss
                 if growth > args.max_rss_growth_mib:
-                    raise RuntimeError(
+                    limit_failures.append(
                         f"RSS grew {growth:.1f} MiB, over the {args.max_rss_growth_mib:.1f} MiB limit"
                     )
             growth_text = "unavailable" if growth is None else f"{growth:.1f} MiB"
+            elapsed_ms = sum(round_trip_samples)
+            report = {
+                "schema": "remote-worker-stability-v1",
+                "worker": {
+                    "darktableCommit": worker_capabilities.get("darktableCommit"),
+                    "darktableVersion": worker_capabilities.get("darktableVersion"),
+                    "protocolMajor": worker_capabilities.get("protocolMajor"),
+                },
+                "inputSha256": image_digest,
+                "edits": args.edits,
+                "surface": {"width": args.width, "height": args.height},
+                "exposureEV": {"low": args.low_ev, "high": args.high_ev},
+                "sequentialRender": {
+                    "roundTripMilliseconds": {
+                        "p50": percentile(round_trip_samples, 0.50),
+                        "p95": percentile(round_trip_samples, 0.95),
+                        "maximum": max(round_trip_samples),
+                        "mean": statistics.fmean(round_trip_samples),
+                    },
+                    "pixelpipeMilliseconds": {
+                        "p50": percentile(pixelpipe_samples, 0.50),
+                        "p95": percentile(pixelpipe_samples, 0.95),
+                    },
+                    "histogramMilliseconds": {
+                        "p50": percentile(histogram_samples, 0.50),
+                        "p95": percentile(histogram_samples, 0.95),
+                    },
+                    "surfaceCopyMilliseconds": {
+                        "p50": percentile(surface_copy_samples, 0.50),
+                        "p95": percentile(surface_copy_samples, 0.95),
+                    },
+                    "maximumCompletedEditsPerSecond": (
+                        args.edits * 1000.0 / elapsed_ms if elapsed_ms else 0.0
+                    ),
+                },
+                "memoryMiB": {
+                    "baseline": baseline_rss,
+                    "maximumSampled": maximum_rss,
+                    "sampledGrowth": growth,
+                    "peakChild": peak_rss,
+                    "sampleCount": rss_sample_count,
+                    "samples": rss_samples,
+                },
+                "finalRevision": revision,
+                "limits": {
+                    "maximumRssMiB": args.max_rss_mib,
+                    "maximumRssGrowthMiB": args.max_rss_growth_mib,
+                    "passed": not limit_failures,
+                    "failures": limit_failures,
+                },
+            }
+            if args.report_json:
+                report_path = Path(args.report_json)
+                report_path.parent.mkdir(parents=True, exist_ok=True)
+                report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
             print(
                 f"PASS: {args.edits} edits/renders in one worker; "
                 f"coupling/reset verified; final revision={revision}; "
                 f"peak child RSS={peak_rss:.1f} MiB; "
-                f"RSS growth={growth_text}"
+                f"RSS growth={growth_text}; "
+                f"sequential round-trip p50={report['sequentialRender']['roundTripMilliseconds']['p50']:.2f} ms, "
+                f"p95={report['sequentialRender']['roundTripMilliseconds']['p95']:.2f} ms, "
+                f"ceiling={report['sequentialRender']['maximumCompletedEditsPerSecond']:.1f} edits/s"
             )
+            if limit_failures:
+                raise RuntimeError("; ".join(limit_failures))
             return 0
         finally:
             if process.poll() is None:
@@ -446,6 +536,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-rss-growth-mib", type=float, default=256.0)
     parser.add_argument("--max-rss-mib", type=float, default=2048.0)
     parser.add_argument(
+        "--rss-sample-interval",
+        type=int,
+        default=100,
+        help="sample live worker RSS every N edits (default: 100)",
+    )
+    parser.add_argument(
         "--expected-first-rgb-sha256",
         help="optional decoded-RGB SHA-256 for the first (low-EV) surface",
     )
@@ -456,9 +552,15 @@ def parse_args() -> argparse.Namespace:
         help="require the test image/state to exercise histogram bins 0 or 1023",
     )
     parser.add_argument("--verbose-worker", action="store_true")
+    parser.add_argument(
+        "--report-json",
+        help="write machine-readable latency and memory measurements to this path",
+    )
     args = parser.parse_args()
     if args.edits < 1:
         parser.error("--edits must be positive")
+    if args.rss_sample_interval < 1:
+        parser.error("--rss-sample-interval must be positive")
     for name in ("width", "height", "max_long_edge"):
         if not 1 <= getattr(args, name) <= 2048:
             parser.error(f"--{name.replace('_', '-')} must be in 1...2048")

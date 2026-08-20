@@ -69,3 +69,21 @@ For a full-size parity check, pass the WP1 decoded-RGB digest for the first
 (`--low-ev`) surface with `--expected-first-rgb-sha256`. Use
 `--expected-commit` to assert the full source commit advertised in worker
 capabilities.
+
+WP7 uses the same path for 10,000 edit/render pairs and emits a
+machine-readable latency/RSS curve:
+
+```sh
+python3 src/remote/worker_harness.py \
+  --worker build/bin/darktable-remote-worker \
+  --image ../protocol/v1/fixtures/images/synthetic-reference.png \
+  --edits 10000 --width 64 --height 48 --max-long-edge 64 \
+  --rss-sample-interval 100 \
+  --report-json ../protocol/reference/wp7-worker-stability.json
+```
+
+The reported "sequential ceiling" is worker-protocol edit acceptance plus
+render response throughput in one process. It excludes gateway, LAN, and iPad
+time and is therefore an engine ceiling, not an end-user latency claim. Live
+RSS is sampled at the requested interval; the process peak is recorded after
+shutdown.
