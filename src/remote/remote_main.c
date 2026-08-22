@@ -24,6 +24,8 @@
 #include "win/main_wrapper.h"
 #endif
 
+static const gchar *_benchmark_run_id = NULL;
+
 static gboolean _has_flag(char **argv, int argc, const char *flag)
 {
   for(int i = 0; i < argc; i++)
@@ -302,23 +304,27 @@ static gboolean _handle(FILE *output, dt_remote_session_t *session, const dt_rem
   }
   if(frame->type == DT_REMOTE_SURFACE_RENDER)
   {
-    uint64_t revision = 0, generation = 0;
+    uint64_t revision = 0, public_revision = 0, session_epoch = 0, generation = 0;
     uint32_t width = 0, height = 0;
     if(!_get_uint64(body, "revision", &revision) || !_get_uint64(body, "generation", &generation) ||
        !_get_uint32(body, "width", &width) || !_get_uint32(body, "height", &height))
       return _send_error(output, request, "protocol_error", "invalid render request");
+    const gboolean has_public_identity =
+        _get_uint64(body, "publicRevision", &public_revision) &&
+        _get_uint64(body, "sessionEpoch", &session_epoch);
+    const char *trace_id = json_object_has_member(body, "traceId")
+                               ? json_object_get_string_member(body, "traceId")
+                               : NULL;
     dt_remote_surface_t surface;
-    double pixelpipe_ms = 0.0;
-    const gint64 total_start = g_get_monotonic_time();
+    dt_remote_render_timing_t render_timing = {0};
     char *error = NULL;
     if(!dt_remote_session_render(session, revision, generation, width, height, &surface,
-                                 &pixelpipe_ms, &error))
+                                 &render_timing, &error))
     {
       const gboolean sent = _send_error(output, request, "render_failed", error);
       g_free(error);
       return sent;
     }
-    const double total_ms = (double)(g_get_monotonic_time() - total_start) / 1000.0;
     JsonObject *response = json_object_new();
     json_object_set_int_member(response, "sessionEpoch", (gint64)session->epoch);
     json_object_set_int_member(response, "revision", (gint64)revision);
@@ -337,13 +343,45 @@ static gboolean _handle(FILE *output, dt_remote_session_t *session, const dt_rem
                                   _histogram_object(&session->analysis));
     JsonObject *timing = json_object_new();
     json_object_set_double_member(timing, "apply", 0.0);
-    json_object_set_double_member(timing, "pixelpipe", pixelpipe_ms);
-    json_object_set_double_member(timing, "surfaceCopy", MAX(0.0, total_ms - pixelpipe_ms));
+    json_object_set_double_member(timing, "pixelpipe", render_timing.pixelpipe_ms);
+    json_object_set_double_member(timing, "snapshot", render_timing.snapshot_ms);
+    json_object_set_double_member(timing, "normalize", render_timing.normalize_ms);
+    json_object_set_double_member(timing, "digest", render_timing.digest_ms);
+    json_object_set_double_member(timing, "analysis", render_timing.analysis_ms);
+    json_object_set_double_member(timing, "surfaceCopy",
+                                  render_timing.snapshot_ms + render_timing.normalize_ms +
+                                      render_timing.digest_ms + render_timing.analysis_ms);
     json_object_set_double_member(timing, "histogram", session->analysis.elapsed_ms);
     json_object_set_object_member(response, "timingMs", timing);
     JsonNode *node = _envelope(request, "surface.rendered", response);
+    const gint64 write_start = g_get_monotonic_time();
     const gboolean sent =
         _send(output, DT_REMOTE_SURFACE_RENDERED, node, surface.pixels, surface.size);
+    const double write_ms = (double)(g_get_monotonic_time() - write_start) / 1000.0;
+    if(_benchmark_run_id)
+    {
+      char expected_trace[96] = {0};
+      g_snprintf(expected_trace, sizeof(expected_trace), "%s/%" G_GUINT64_FORMAT,
+                 _benchmark_run_id, generation);
+      const char *correlated_trace = trace_id && !strcmp(trace_id, expected_trace)
+                                         ? trace_id
+                                         : expected_trace;
+      fprintf(stderr,
+              "{\"runId\":\"%s\",\"traceId\":\"%s"
+              "\",\"component\":\"worker\",\"event\":\"privateWrite\",\"stateDigest\":\"%s\",\"sessionEpoch\":%"
+              G_GUINT64_FORMAT ",\"revision\":%" G_GUINT64_FORMAT
+              ",\"engineRevision\":%" G_GUINT64_FORMAT ",\"generation\":%" G_GUINT64_FORMAT
+              ",\"bytes\":%zu,\"durationMs\":%.6f}\n",
+              _benchmark_run_id, correlated_trace, session->state_digest,
+              has_public_identity ? session_epoch : 0,
+              has_public_identity ? public_revision : revision, revision, generation, surface.size,
+              write_ms);
+    }
+    else
+      fprintf(stderr,
+              "{\"component\":\"worker\",\"event\":\"privateWrite\",\"revision\":%" G_GUINT64_FORMAT
+              ",\"generation\":%" G_GUINT64_FORMAT ",\"bytes\":%zu,\"durationMs\":%.6f}\n",
+              revision, generation, surface.size, write_ms);
     dt_remote_surface_clear(&surface);
     return sent;
   }
@@ -352,6 +390,8 @@ static gboolean _handle(FILE *output, dt_remote_session_t *session, const dt_rem
 
 int main(int argc, char **argv)
 {
+  _benchmark_run_id = g_getenv("DARKTABLE_REMOTE_BENCHMARK_RUN_ID");
+  if(_benchmark_run_id && !g_uuid_string_is_valid(_benchmark_run_id)) _benchmark_run_id = NULL;
   dt_loc_init(NULL, NULL, NULL, NULL, NULL, NULL);
   char localedir[PATH_MAX] = {0};
   dt_loc_get_localedir(localedir, sizeof(localedir));

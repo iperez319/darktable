@@ -45,7 +45,8 @@ gboolean dt_remote_session_reset_exposure(dt_remote_session_t *session, uint64_t
                                           char **error);
 gboolean dt_remote_session_render(dt_remote_session_t *session, uint64_t revision,
                                   uint64_t generation, uint32_t width, uint32_t height,
-                                  dt_remote_surface_t *surface, double *render_ms, char **error);
+                                  dt_remote_surface_t *surface,
+                                  dt_remote_render_timing_t *timing, char **error);
 void dt_remote_session_current_values(const dt_remote_session_t *session, float *exposure_ev,
                                       float *black);
 void dt_remote_session_baseline_values(const dt_remote_session_t *session, float *exposure_ev,

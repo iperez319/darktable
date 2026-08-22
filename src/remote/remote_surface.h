@@ -23,6 +23,15 @@ typedef struct dt_remote_surface_t
   dt_hash_t backbuffer_hash;
 } dt_remote_surface_t;
 
+typedef struct dt_remote_render_timing_t
+{
+  double pixelpipe_ms;
+  double snapshot_ms;
+  double normalize_ms;
+  double digest_ms;
+  double analysis_ms;
+} dt_remote_render_timing_t;
+
 gboolean dt_remote_surface_from_pipe(dt_dev_pixelpipe_t *pipe, dt_remote_surface_t *surface,
-                                     char **error);
+                                     dt_remote_render_timing_t *timing, char **error);
 void dt_remote_surface_clear(dt_remote_surface_t *surface);

@@ -14,7 +14,7 @@
 #include <string.h>
 
 gboolean dt_remote_surface_from_pipe(dt_dev_pixelpipe_t *pipe, dt_remote_surface_t *surface,
-                                     char **error)
+                                     dt_remote_render_timing_t *timing, char **error)
 {
   if(error)
     *error = NULL;
@@ -26,8 +26,11 @@ gboolean dt_remote_surface_from_pipe(dt_dev_pixelpipe_t *pipe, dt_remote_surface
   }
   memset(surface, 0, sizeof(*surface));
   dt_dev_backbuffer_snapshot_t snapshot;
+  const gint64 snapshot_start = g_get_monotonic_time();
   if(!dt_dev_pixelpipe_backbuffer_snapshot(pipe, &snapshot, error))
     return FALSE;
+  if(timing)
+    timing->snapshot_ms = (double)(g_get_monotonic_time() - snapshot_start) / 1000.0;
   if(snapshot.width > 2048 || snapshot.height > 2048 ||
      snapshot.size > DT_REMOTE_MAX_ATTACHMENT_BYTES)
   {
@@ -43,6 +46,7 @@ gboolean dt_remote_surface_from_pipe(dt_dev_pixelpipe_t *pipe, dt_remote_surface
   surface->height = (uint32_t)snapshot.height;
   surface->bytes_per_row = surface->width * 4;
   surface->backbuffer_hash = snapshot.hash;
+  const gint64 normalize_start = g_get_monotonic_time();
   for(size_t i = 0; i < snapshot.size / 4; i++)
   {
     uint32_t argb = 0;
@@ -53,11 +57,16 @@ gboolean dt_remote_surface_from_pipe(dt_dev_pixelpipe_t *pipe, dt_remote_surface
     surface->pixels[i * 4 + 3] = 255;
   }
   g_free(snapshot.data);
+  if(timing)
+    timing->normalize_ms = (double)(g_get_monotonic_time() - normalize_start) / 1000.0;
 
+  const gint64 digest_start = g_get_monotonic_time();
   GChecksum *checksum = g_checksum_new(G_CHECKSUM_SHA256);
   g_checksum_update(checksum, surface->pixels, surface->size);
   surface->pixel_digest = g_strdup_printf("sha256:%s", g_checksum_get_string(checksum));
   g_checksum_free(checksum);
+  if(timing)
+    timing->digest_ms = (double)(g_get_monotonic_time() - digest_start) / 1000.0;
   return TRUE;
 }
 

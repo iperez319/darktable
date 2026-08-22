@@ -129,7 +129,8 @@ void dt_remote_session_cleanup(dt_remote_session_t *session)
 
 static gboolean _render_unlocked(dt_remote_session_t *session, uint64_t revision,
                                  uint64_t generation, uint32_t width, uint32_t height,
-                                 dt_remote_surface_t *surface, double *render_ms, char **error);
+                                 dt_remote_surface_t *surface,
+                                 dt_remote_render_timing_t *timing, char **error);
 
 gboolean dt_remote_session_open(dt_remote_session_t *session, const char *image_path,
                                 uint32_t maximum_long_edge, const char *color_contract,
@@ -207,9 +208,9 @@ gboolean dt_remote_session_open(dt_remote_session_t *session, const char *image_
   _update_state_digest(session);
 
   dt_remote_surface_t warm_surface;
-  double warm_ms = 0.0;
-  if(!_render_unlocked(session, 0, 0, maximum_long_edge, maximum_long_edge, &warm_surface, &warm_ms,
-                       error))
+  dt_remote_render_timing_t warm_timing = {0};
+  if(!_render_unlocked(session, 0, 0, maximum_long_edge, maximum_long_edge, &warm_surface,
+                       &warm_timing, error))
   {
     session->open = FALSE;
     dt_remote_exposure_cleanup(&session->exposure);
@@ -291,10 +292,13 @@ gboolean dt_remote_session_reset_exposure(dt_remote_session_t *session, uint64_t
 
 static gboolean _render_unlocked(dt_remote_session_t *session, uint64_t revision,
                                  uint64_t generation, uint32_t width, uint32_t height,
-                                 dt_remote_surface_t *surface, double *render_ms, char **error)
+                                 dt_remote_surface_t *surface,
+                                 dt_remote_render_timing_t *timing, char **error)
 {
   if(error)
     *error = NULL;
+  if(timing)
+    memset(timing, 0, sizeof(*timing));
   if(!session->open)
   {
     _set_error(error, "session is not open");
@@ -319,28 +323,32 @@ static gboolean _render_unlocked(dt_remote_session_t *session, uint64_t revision
   const gint64 start = g_get_monotonic_time();
   dt_dev_process_image_job(&session->dev, &session->dev.full, session->dev.full.pipe,
                            (dt_signal_t)-1, session->dev.full.pipe->devid);
-  if(render_ms)
-    *render_ms = (double)(g_get_monotonic_time() - start) / 1000.0;
-  if(!dt_remote_surface_from_pipe(session->dev.full.pipe, surface, error))
+  if(timing)
+    timing->pixelpipe_ms = (double)(g_get_monotonic_time() - start) / 1000.0;
+  if(!dt_remote_surface_from_pipe(session->dev.full.pipe, surface, timing, error))
     return FALSE;
+  const gint64 analysis_start = g_get_monotonic_time();
   if(!dt_remote_analysis_finalize(&session->analysis, session->state_digest,
                                   surface->pixel_digest, surface->width, surface->height, error))
   {
     dt_remote_surface_clear(surface);
     return FALSE;
   }
+  if(timing)
+    timing->analysis_ms = (double)(g_get_monotonic_time() - analysis_start) / 1000.0;
   return TRUE;
 }
 
 gboolean dt_remote_session_render(dt_remote_session_t *session, uint64_t revision,
                                   uint64_t generation, uint32_t width, uint32_t height,
-                                  dt_remote_surface_t *surface, double *render_ms, char **error)
+                                  dt_remote_surface_t *surface,
+                                  dt_remote_render_timing_t *timing, char **error)
 {
   if(error)
     *error = NULL;
   g_mutex_lock(&session->mutex);
   const gboolean ok =
-      _render_unlocked(session, revision, generation, width, height, surface, render_ms, error);
+      _render_unlocked(session, revision, generation, width, height, surface, timing, error);
   g_mutex_unlock(&session->mutex);
   return ok;
 }

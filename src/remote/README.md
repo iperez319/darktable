@@ -54,6 +54,24 @@ reusing that generation afterward, checks deterministic repeated-state digests
 and Exposure-driven Black coupling, and verifies that reset restores the
 complete baseline blob digest.
 
+The worker now reports separate `snapshot`, `normalize`, `digest`, and
+`analysis` spans while retaining aggregate `surfaceCopy` compatibility. It
+emits a structured `privateWrite` event after the attachment flush. The harness
+supports `alternating`, `sweep`, `ramp`, `random-unique`, `gesture`, and `no-op`
+workloads, unrecorded warmups, deterministic bootstrap confidence intervals,
+per-sample CSV/JSON, optional canonical BGRA capture, and
+`--worker-debug-perf` per-module/cache diagnostics. For example:
+
+```sh
+python3 src/remote/worker_harness.py \
+  --worker build-mvp/bin/darktable-remote-worker \
+  --image ../sample-images/nikon_24mp.nef \
+  --workload random-unique --seed 20260820 \
+  --warmups 20 --edits 200 --width 2048 --height 1357 \
+  --max-long-edge 2048 --worker-debug-perf \
+  --report-json /tmp/worker.json --report-csv /tmp/worker.csv
+```
+
 ```sh
 python3 src/remote/worker_harness.py \
   --worker build/bin/darktable-remote-worker \

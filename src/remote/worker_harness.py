@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
+import math
 import os
+import random
 import resource
 import statistics
 import struct
@@ -194,6 +197,67 @@ def percentile(samples: list[float], fraction: float) -> float:
     return ordered[rank]
 
 
+def bootstrap_interval(
+    samples: list[float], fraction: float, *, seed: int, iterations: int = 2000
+) -> list[float]:
+    """Return a deterministic percentile-bootstrap 95% confidence interval."""
+    if not samples:
+        return [0.0, 0.0]
+    rng = random.Random(seed)
+    estimates = [
+        percentile([rng.choice(samples) for _ in samples], fraction)
+        for _ in range(iterations)
+    ]
+    return [percentile(estimates, 0.025), percentile(estimates, 0.975)]
+
+
+def metric_summary(samples: list[float], seed: int) -> dict:
+    return {
+        "count": len(samples),
+        "p50": percentile(samples, 0.50),
+        "p90": percentile(samples, 0.90),
+        "p95": percentile(samples, 0.95),
+        "p99": percentile(samples, 0.99),
+        "maximum": max(samples, default=0.0),
+        "mean": statistics.fmean(samples) if samples else 0.0,
+        "standardDeviation": statistics.stdev(samples) if len(samples) > 1 else 0.0,
+        "p50Bootstrap95CI": bootstrap_interval(samples, 0.50, seed=seed),
+        "p95Bootstrap95CI": bootstrap_interval(samples, 0.95, seed=seed + 1),
+    }
+
+
+def workload_values(args: argparse.Namespace, count: int) -> list[float]:
+    if args.workload == "alternating":
+        return [args.low_ev if index % 2 == 0 else args.high_ev for index in range(count)]
+    if args.workload in ("sweep", "ramp"):
+        if count == 1:
+            return [args.high_ev]
+        return [
+            args.low_ev + (args.high_ev - args.low_ev) * index / (count - 1)
+            for index in range(count)
+        ]
+    if args.workload == "random-unique":
+        rng = random.Random(args.seed)
+        values: list[float] = []
+        seen: set[float] = set()
+        while len(values) < count:
+            value = rng.uniform(args.low_ev, args.high_ev)
+            if value not in seen:
+                seen.add(value)
+                values.append(value)
+        return values
+    if args.workload == "gesture":
+        return [
+            args.low_ev
+            + (args.high_ev - args.low_ev)
+            * (0.5 + 0.5 * math.sin(index * math.tau / 73.0))
+            for index in range(count)
+        ]
+    if args.workload == "no-op":
+        return [args.low_ev] * count
+    raise ValueError(f"unsupported workload: {args.workload}")
+
+
 def run(args: argparse.Namespace) -> int:
     worker = Path(args.worker).resolve()
     image = Path(args.image).resolve()
@@ -210,6 +274,7 @@ def run(args: argparse.Namespace) -> int:
         root = Path(temporary)
         command = [
             str(worker),
+            *(["-d", "perf"] if args.worker_debug_perf else []),
             "--core",
             "--configdir",
             str(root / "config"),
@@ -275,6 +340,10 @@ def run(args: argparse.Namespace) -> int:
             pixelpipe_samples: list[float] = []
             histogram_samples: list[float] = []
             surface_copy_samples: list[float] = []
+            split_samples: dict[str, list[float]] = {
+                name: [] for name in ("snapshot", "normalize", "digest", "analysis")
+            }
+            sample_records: list[dict] = []
             rss_sample_count = 1 if baseline_rss is not None else 0
 
             # An invalid mutation must not advance either revision or generation.
@@ -296,10 +365,16 @@ def run(args: argparse.Namespace) -> int:
             )
             read_error(process.stdout, "invalid_exposure")
 
-            for index in range(args.edits):
+            values = workload_values(args, args.warmups + args.edits)
+            capture_dir = Path(args.capture_dir).resolve() if args.capture_dir else None
+            if capture_dir:
+                capture_dir.mkdir(parents=True, exist_ok=True)
+
+            for overall_index, exposure in enumerate(values):
+                measured = overall_index >= args.warmups
+                index = overall_index - args.warmups
                 round_trip_start = time.monotonic_ns()
-                generation = index + 1
-                exposure = args.low_ev if index % 2 == 0 else args.high_ev
+                generation = overall_index + 1
                 request_id = str(uuid.uuid4())
                 write_frame(
                     process.stdin,
@@ -342,7 +417,7 @@ def run(args: argparse.Namespace) -> int:
                     ),
                 )
                 rendered, pixels = read_frame(process.stdout, RENDERED)
-                round_trip_samples.append((time.monotonic_ns() - round_trip_start) / 1_000_000.0)
+                round_trip_ms = (time.monotonic_ns() - round_trip_start) / 1_000_000.0
                 histogram_digest = validate_surface(
                     rendered,
                     pixels,
@@ -357,7 +432,7 @@ def run(args: argparse.Namespace) -> int:
                     raise RuntimeError(
                         "identical exposure states produced different histograms"
                     )
-                if index == 0 and args.expected_first_rgb_sha256:
+                if measured and index == 0 and args.expected_first_rgb_sha256:
                     actual_rgb_digest = rgb_sha256(pixels)
                     if actual_rgb_digest != args.expected_first_rgb_sha256:
                         raise RuntimeError(
@@ -365,10 +440,50 @@ def run(args: argparse.Namespace) -> int:
                             f"{actual_rgb_digest}"
                         )
                 timing = rendered["body"].get("timingMs", {})
-                pixelpipe_samples.append(float(timing.get("pixelpipe", 0.0)))
-                histogram_samples.append(float(timing.get("histogram", 0.0)))
-                surface_copy_samples.append(float(timing.get("surfaceCopy", 0.0)))
-                if index % args.rss_sample_interval == 0 or index + 1 == args.edits:
+                if measured:
+                    round_trip_samples.append(round_trip_ms)
+                    pixelpipe_samples.append(float(timing.get("pixelpipe", 0.0)))
+                    histogram_samples.append(float(timing.get("histogram", 0.0)))
+                    surface_copy_samples.append(float(timing.get("surfaceCopy", 0.0)))
+                    for name in split_samples:
+                        split_samples[name].append(float(timing.get(name, 0.0)))
+                    sample_records.append(
+                        {
+                            "sample": index,
+                            "generation": generation,
+                            "revision": revision,
+                            "exposureEV": exposure,
+                            "roundTripMs": round_trip_ms,
+                            **{f"{name}Ms": float(timing.get(name, 0.0)) for name in (
+                                "pixelpipe", "histogram", "surfaceCopy", "snapshot",
+                                "normalize", "digest", "analysis"
+                            )},
+                            "pixelDigest": rendered["body"]["pixelDigest"],
+                        }
+                    )
+                    if capture_dir and (
+                        index == 0
+                        or index + 1 == args.edits
+                        or (args.capture_every and (index + 1) % args.capture_every == 0)
+                    ):
+                        capture_path = capture_dir / f"frame-{index:04d}-g{generation}.bgra"
+                        capture_path.write_bytes(pixels)
+                        capture_path.with_suffix(".json").write_text(
+                            json.dumps(
+                                {
+                                    "generation": generation,
+                                    "revision": revision,
+                                    "exposureEV": exposure,
+                                    "width": rendered["body"]["width"],
+                                    "height": rendered["body"]["height"],
+                                    "pixelDigest": rendered["body"]["pixelDigest"],
+                                },
+                                indent=2,
+                                sort_keys=True,
+                            )
+                            + "\n"
+                        )
+                if measured and (index % args.rss_sample_interval == 0 or index + 1 == args.edits):
                     rss = process_rss_mib(process.pid)
                     if rss is not None:
                         rss_sample_count += 1
@@ -377,7 +492,7 @@ def run(args: argparse.Namespace) -> int:
 
             # Exercise the desktop-compatible coupling rule, then prove full-blob reset
             # restores the original deterministic digest (including hidden fields).
-            generation = args.edits + 1
+            generation = args.warmups + args.edits + 1
             request_id = str(uuid.uuid4())
             write_frame(
                 process.stdin,
@@ -452,34 +567,28 @@ def run(args: argparse.Namespace) -> int:
             growth_text = "unavailable" if growth is None else f"{growth:.1f} MiB"
             elapsed_ms = sum(round_trip_samples)
             report = {
-                "schema": "remote-worker-stability-v1",
+                "schema": "remote-worker-preview-benchmark-v2",
                 "worker": {
                     "darktableCommit": worker_capabilities.get("darktableCommit"),
                     "darktableVersion": worker_capabilities.get("darktableVersion"),
                     "protocolMajor": worker_capabilities.get("protocolMajor"),
                 },
                 "inputSha256": image_digest,
+                "baselineStateDigest": baseline_digest,
                 "edits": args.edits,
+                "warmups": args.warmups,
+                "workload": args.workload,
+                "seed": args.seed,
                 "surface": {"width": args.width, "height": args.height},
                 "exposureEV": {"low": args.low_ev, "high": args.high_ev},
                 "sequentialRender": {
-                    "roundTripMilliseconds": {
-                        "p50": percentile(round_trip_samples, 0.50),
-                        "p95": percentile(round_trip_samples, 0.95),
-                        "maximum": max(round_trip_samples),
-                        "mean": statistics.fmean(round_trip_samples),
-                    },
-                    "pixelpipeMilliseconds": {
-                        "p50": percentile(pixelpipe_samples, 0.50),
-                        "p95": percentile(pixelpipe_samples, 0.95),
-                    },
-                    "histogramMilliseconds": {
-                        "p50": percentile(histogram_samples, 0.50),
-                        "p95": percentile(histogram_samples, 0.95),
-                    },
-                    "surfaceCopyMilliseconds": {
-                        "p50": percentile(surface_copy_samples, 0.50),
-                        "p95": percentile(surface_copy_samples, 0.95),
+                    "roundTripMilliseconds": metric_summary(round_trip_samples, args.seed),
+                    "pixelpipeMilliseconds": metric_summary(pixelpipe_samples, args.seed + 10),
+                    "histogramMilliseconds": metric_summary(histogram_samples, args.seed + 20),
+                    "surfaceCopyMilliseconds": metric_summary(surface_copy_samples, args.seed + 30),
+                    "splitMilliseconds": {
+                        name: metric_summary(samples, args.seed + 40 + offset)
+                        for offset, (name, samples) in enumerate(split_samples.items())
                     },
                     "maximumCompletedEditsPerSecond": (
                         args.edits * 1000.0 / elapsed_ms if elapsed_ms else 0.0
@@ -494,6 +603,7 @@ def run(args: argparse.Namespace) -> int:
                     "samples": rss_samples,
                 },
                 "finalRevision": revision,
+                "samples": sample_records,
                 "limits": {
                     "maximumRssMiB": args.max_rss_mib,
                     "maximumRssGrowthMiB": args.max_rss_growth_mib,
@@ -505,6 +615,13 @@ def run(args: argparse.Namespace) -> int:
                 report_path = Path(args.report_json)
                 report_path.parent.mkdir(parents=True, exist_ok=True)
                 report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+            if args.report_csv:
+                csv_path = Path(args.report_csv)
+                csv_path.parent.mkdir(parents=True, exist_ok=True)
+                with csv_path.open("w", newline="") as stream:
+                    writer = csv.DictWriter(stream, fieldnames=list(sample_records[0]))
+                    writer.writeheader()
+                    writer.writerows(sample_records)
             print(
                 f"PASS: {args.edits} edits/renders in one worker; "
                 f"coupling/reset verified; final revision={revision}; "
@@ -528,6 +645,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--worker", required=True, help="path to darktable-remote-worker")
     parser.add_argument("--image", required=True, help="fixed RAW/JPEG/PNG input")
     parser.add_argument("--edits", type=int, default=1000)
+    parser.add_argument("--warmups", type=int, default=20)
+    parser.add_argument(
+        "--workload",
+        choices=("alternating", "sweep", "ramp", "random-unique", "gesture", "no-op"),
+        default="alternating",
+    )
+    parser.add_argument("--seed", type=int, default=20260820)
     parser.add_argument("--width", type=int, default=256)
     parser.add_argument("--height", type=int, default=256)
     parser.add_argument("--max-long-edge", type=int, default=256)
@@ -553,12 +677,32 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--verbose-worker", action="store_true")
     parser.add_argument(
+        "--worker-debug-perf",
+        action="store_true",
+        help="enable darktable per-module and pixelpipe-cache performance diagnostics",
+    )
+    parser.add_argument(
         "--report-json",
         help="write machine-readable latency and memory measurements to this path",
+    )
+    parser.add_argument("--report-csv", help="write one measured sample per CSV row")
+    parser.add_argument(
+        "--capture-dir",
+        help="optionally retain first/last canonical BGRA frames and metadata",
+    )
+    parser.add_argument(
+        "--capture-every",
+        type=int,
+        default=0,
+        help="with --capture-dir, additionally retain every Nth measured frame",
     )
     args = parser.parse_args()
     if args.edits < 1:
         parser.error("--edits must be positive")
+    if args.warmups < 0:
+        parser.error("--warmups must not be negative")
+    if args.capture_every < 0:
+        parser.error("--capture-every must not be negative")
     if args.rss_sample_interval < 1:
         parser.error("--rss-sample-interval must be positive")
     for name in ("width", "height", "max_long_edge"):
