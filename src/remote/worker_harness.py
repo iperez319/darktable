@@ -22,10 +22,10 @@ from pathlib import Path
 
 
 MAGIC = b"DTRW"
-MAJOR = 1
+MAJOR = 2
 HEADER = struct.Struct(">4sHHIQ")
 MAX_JSON = 256 * 1024
-MAX_ATTACHMENT = 16 * 1024 * 1024
+MAX_ATTACHMENT = 32 * 1024 * 1024
 
 HELLO = 1
 OPEN = 2
@@ -33,10 +33,14 @@ SET_EXPOSURE = 3
 RESET_EXPOSURE = 4
 RENDER = 5
 SHUTDOWN = 7
+CHECKPOINT_XMP = 8
+EXPORT_JPEG = 9
+CANCEL = 10
 CAPABILITIES = 0x8001
 OPENED = 0x8002
 EXPOSURE_ACCEPTED = 0x8003
 RENDERED = 0x8004
+ARTIFACT_WRITTEN = 0x8005
 ERROR = 0xFFFF
 
 
@@ -121,6 +125,8 @@ def validate_surface(
     generation: int,
     revision: int,
     require_histogram_edge_bins: bool,
+    expected_role: str = "overview",
+    expected_coverage: dict[str, float] | None = None,
 ) -> str:
     body = message["body"]
     width = int(body["width"])
@@ -128,7 +134,7 @@ def validate_surface(
     row_bytes = int(body["bytesPerRow"])
     if body["generation"] != generation or body["revision"] != revision:
         raise RuntimeError("surface ordering metadata does not match the request")
-    if not (1 <= width <= 2048 and 1 <= height <= 2048):
+    if not (1 <= width <= 4096 and 1 <= height <= 4096):
         raise RuntimeError("surface dimensions are outside protocol limits")
     if row_bytes != width * 4 or len(pixels) != row_bytes * height:
         raise RuntimeError("surface dimensions and attachment length disagree")
@@ -137,6 +143,16 @@ def validate_surface(
         raise RuntimeError("surface SHA-256 mismatch")
     if pixels[3::4] != b"\xff" * (len(pixels) // 4):
         raise RuntimeError("surface contains non-opaque alpha")
+    if expected_coverage is None:
+        expected_coverage = {"x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0}
+    if body.get("role") != expected_role or body.get("coverage") != expected_coverage:
+        raise RuntimeError(
+            "surface role or coverage does not match the request: "
+            f"expected {expected_role} {expected_coverage}, "
+            f"received {body.get('role')} {body.get('coverage')}"
+        )
+    if int(body.get("sourcePixelWidth", 0)) <= 0 or int(body.get("sourcePixelHeight", 0)) <= 0:
+        raise RuntimeError("surface is missing source dimensions")
 
     result_digest = body.get("pixelpipeResultDigest", "")
     if not (
@@ -186,6 +202,43 @@ def rgb_sha256(pixels: bytes) -> str:
     rgb[1::3] = pixels[1::4]
     rgb[2::3] = pixels[0::4]
     return hashlib.sha256(rgb).hexdigest()
+
+
+def jpeg_dimensions(encoded: bytes) -> tuple[int, int]:
+    if not encoded.startswith(b"\xff\xd8"):
+        raise RuntimeError("export is not a JPEG")
+    offset = 2
+    while offset + 4 <= len(encoded):
+        if encoded[offset] != 0xFF:
+            offset += 1
+            continue
+        marker = encoded[offset + 1]
+        offset += 2
+        if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+            continue
+        length = int.from_bytes(encoded[offset:offset + 2], "big")
+        if length < 2 or offset + length > len(encoded):
+            break
+        if marker in range(0xC0, 0xC4):
+            return (
+                int.from_bytes(encoded[offset + 5:offset + 7], "big"),
+                int.from_bytes(encoded[offset + 3:offset + 5], "big"),
+            )
+        offset += length
+    raise RuntimeError("JPEG dimensions could not be decoded")
+
+
+def validate_artifact(message: dict, path: Path, expected_kind: str) -> bytes:
+    encoded = path.read_bytes()
+    body = message["body"]
+    digest = "sha256:" + hashlib.sha256(encoded).hexdigest()
+    if (
+        body.get("kind") != expected_kind
+        or int(body.get("bytes", -1)) != len(encoded)
+        or body.get("digest") != digest
+    ):
+        raise RuntimeError(f"{expected_kind} artifact response does not match the file")
+    return encoded
 
 
 def percentile(samples: list[float], fraction: float) -> float:
@@ -292,10 +345,10 @@ def run(args: argparse.Namespace) -> int:
                 process.stdin,
                 HELLO,
                 envelope("worker.hello", request_id, session_id,
-                         {"gatewayBuild": "wp2-harness/1", "protocolMajor": 1}),
+                         {"gatewayBuild": "editor-foundation-harness/2", "protocolMajor": MAJOR}),
             )
             capabilities, attachment = read_frame(process.stdout, CAPABILITIES)
-            if attachment or capabilities["body"]["protocolMajor"] != 1:
+            if attachment or capabilities["body"]["protocolMajor"] != MAJOR:
                 raise RuntimeError("invalid worker capabilities response")
             worker_capabilities = capabilities["body"]
             if capabilities["body"].get("histogramDomains") != [
@@ -331,6 +384,10 @@ def run(args: argparse.Namespace) -> int:
             baseline_black = float(opened["body"]["baselineValues"]["black"])
             baseline_exposure = float(opened["body"]["baselineValues"]["exposureEV"])
             baseline_digest = opened["body"]["stateDigest"]
+            source_dimensions = (
+                int(opened["body"]["sourcePixelWidth"]),
+                int(opened["body"]["sourcePixelHeight"]),
+            )
             baseline_rss = process_rss_mib(process.pid)
             maximum_rss = baseline_rss
             rss_samples = [] if baseline_rss is None else [{"edit": 0, "rssMiB": baseline_rss}]
@@ -411,6 +468,10 @@ def run(args: argparse.Namespace) -> int:
                         {
                             "generation": generation,
                             "revision": revision,
+                            "role": "overview",
+                            "normalizedRect": {"x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0},
+                            "sourcePixelsPerOutputPixel": 1.0,
+                            "overscanPixels": 0,
                             "width": args.width,
                             "height": args.height,
                         },
@@ -540,6 +601,298 @@ def run(args: argparse.Namespace) -> int:
                 raise RuntimeError("reset did not restore the complete baseline parameter blob")
             revision = int(reset["body"]["revision"])
 
+            # The full-input viewport and reduced-input overview must carry the
+            # same state/output contract at matching complete-image geometry.
+            # Their pixels are measured but are not expected to be identical:
+            # darktable deliberately starts those roles from different mipmaps.
+            parity_generation = generation + 1
+            parity_surfaces: dict[str, bytes] = {}
+            parity_messages: dict[str, dict] = {}
+            source_scale = max(
+                source_dimensions[0] / args.width,
+                source_dimensions[1] / args.height,
+            )
+            for role in ("overview", "viewport"):
+                request_id = str(uuid.uuid4())
+                write_frame(
+                    process.stdin,
+                    RENDER,
+                    envelope(
+                        "surface.render",
+                        request_id,
+                        session_id,
+                        {
+                            "generation": parity_generation,
+                            "revision": revision,
+                            "role": role,
+                            "normalizedRect": {
+                                "x": 0.0,
+                                "y": 0.0,
+                                "width": 1.0,
+                                "height": 1.0,
+                            },
+                            "sourcePixelsPerOutputPixel": source_scale,
+                            "overscanPixels": 0,
+                            "width": args.width,
+                            "height": args.height,
+                        },
+                    ),
+                )
+                parity, parity_pixels = read_frame(process.stdout, RENDERED)
+                validate_surface(
+                    parity,
+                    parity_pixels,
+                    parity_generation,
+                    revision,
+                    args.require_histogram_edge_bins,
+                    expected_role=role,
+                )
+                parity_surfaces[role] = parity_pixels
+                parity_messages[role] = parity
+            overview_body = parity_messages["overview"]["body"]
+            viewport_body = parity_messages["viewport"]["body"]
+            if (
+                overview_body["width"] != viewport_body["width"]
+                or overview_body["height"] != viewport_body["height"]
+                or overview_body["stateDigest"] != viewport_body["stateDigest"]
+                or overview_body["moduleStackDigest"] != viewport_body["moduleStackDigest"]
+                or overview_body["pixelFormat"] != viewport_body["pixelFormat"]
+            ):
+                raise RuntimeError(
+                    "overview/viewport state, geometry, or output contract does not match"
+                )
+            overview_viewport_absolute = [
+                abs(left - right)
+                for index, (left, right) in enumerate(
+                    zip(parity_surfaces["overview"], parity_surfaces["viewport"])
+                )
+                if index % 4 != 3
+            ]
+            overview_viewport_delta = {
+                "differingColorBytes": sum(
+                    value != 0 for value in overview_viewport_absolute
+                ),
+                "maximum": max(overview_viewport_absolute, default=0),
+                "mean": statistics.fmean(overview_viewport_absolute)
+                if overview_viewport_absolute
+                else 0.0,
+                "p95": percentile(overview_viewport_absolute, 0.95),
+                "p99": percentile(overview_viewport_absolute, 0.99),
+            }
+
+            native_x = (source_dimensions[0] - args.width) // 2
+            native_y = (source_dimensions[1] - args.height) // 2
+            native_coverage = {
+                "x": native_x / source_dimensions[0],
+                "y": native_y / source_dimensions[1],
+                "width": args.width / source_dimensions[0],
+                "height": args.height / source_dimensions[1],
+            }
+            if args.verify_viewport_cancel:
+                canceled_request_id = str(uuid.uuid4())
+                write_frame(
+                    process.stdin,
+                    RENDER,
+                    envelope(
+                        "surface.render",
+                        canceled_request_id,
+                        session_id,
+                        {
+                            "generation": parity_generation + 1,
+                            "revision": revision,
+                            "role": "viewport",
+                            "normalizedRect": native_coverage,
+                            "sourcePixelsPerOutputPixel": 1.0,
+                            "overscanPixels": 0,
+                            "width": args.width,
+                            "height": args.height,
+                        },
+                    ),
+                )
+                time.sleep(args.viewport_cancel_delay_ms / 1000.0)
+                write_frame(
+                    process.stdin,
+                    CANCEL,
+                    envelope(
+                        "surface.cancel",
+                        str(uuid.uuid4()),
+                        session_id,
+                        {"generation": parity_generation + 1},
+                    ),
+                )
+                canceled = read_error(process.stdout, "render_superseded")
+                if canceled.get("requestId") != canceled_request_id:
+                    raise RuntimeError("cancellation response did not identify the superseded render")
+            request_id = str(uuid.uuid4())
+            write_frame(
+                process.stdin,
+                RENDER,
+                envelope(
+                    "surface.render",
+                    request_id,
+                    session_id,
+                    {
+                        "generation": parity_generation + 1,
+                        "revision": revision,
+                        "role": "viewport",
+                        "normalizedRect": native_coverage,
+                        "sourcePixelsPerOutputPixel": 1.0,
+                        "overscanPixels": 0,
+                        "width": args.width,
+                        "height": args.height,
+                    },
+                ),
+            )
+            native, native_pixels = read_frame(process.stdout, RENDERED)
+            validate_surface(
+                native,
+                native_pixels,
+                parity_generation + 1,
+                revision,
+                args.require_histogram_edge_bins,
+                expected_role="viewport",
+                expected_coverage=native_coverage,
+            )
+            if args.verify_native_roi_pixels:
+                source_width, source_height = source_dimensions
+                if (
+                    source_width > 4096
+                    or source_height > 4096
+                    or source_width * source_height * 4 > MAX_ATTACHMENT
+                ):
+                    raise RuntimeError(
+                        "source is too large for the bounded full-surface ROI parity fixture"
+                    )
+                request_id = str(uuid.uuid4())
+                write_frame(
+                    process.stdin,
+                    RENDER,
+                    envelope(
+                        "surface.render",
+                        request_id,
+                        session_id,
+                        {
+                            "generation": parity_generation + 2,
+                            "revision": revision,
+                            "role": "viewport",
+                            "normalizedRect": {
+                                "x": 0.0,
+                                "y": 0.0,
+                                "width": 1.0,
+                                "height": 1.0,
+                            },
+                            "sourcePixelsPerOutputPixel": 1.0,
+                            "overscanPixels": 0,
+                            "width": source_width,
+                            "height": source_height,
+                        },
+                    ),
+                )
+                full, full_pixels = read_frame(process.stdout, RENDERED)
+                validate_surface(
+                    full,
+                    full_pixels,
+                    parity_generation + 2,
+                    revision,
+                    args.require_histogram_edge_bins,
+                    expected_role="viewport",
+                )
+                expected_native = b"".join(
+                    full_pixels[
+                        ((native_y + row) * source_width + native_x) * 4:
+                        ((native_y + row) * source_width + native_x + args.width) * 4
+                    ]
+                    for row in range(args.height)
+                )
+                if native_pixels != expected_native:
+                    absolute = [
+                        abs(left - right)
+                        for index, (left, right) in enumerate(
+                            zip(native_pixels, expected_native)
+                        )
+                        if index % 4 != 3
+                    ]
+                    differing = sum(value != 0 for value in absolute)
+                    best_offset = (0, 0)
+                    best_mean = statistics.fmean(absolute)
+                    for offset_y in range(-4, 5):
+                        for offset_x in range(-4, 5):
+                            crop_x = native_x + offset_x
+                            crop_y = native_y + offset_y
+                            if (
+                                crop_x < 0
+                                or crop_y < 0
+                                or crop_x + args.width > source_width
+                                or crop_y + args.height > source_height
+                            ):
+                                continue
+                            candidate = b"".join(
+                                full_pixels[
+                                    ((crop_y + row) * source_width + crop_x) * 4:
+                                    ((crop_y + row) * source_width + crop_x + args.width) * 4
+                                ]
+                                for row in range(args.height)
+                            )
+                            candidate_delta = [
+                                abs(left - right)
+                                for index, (left, right) in enumerate(
+                                    zip(native_pixels, candidate)
+                                )
+                                if index % 4 != 3
+                            ]
+                            candidate_mean = statistics.fmean(candidate_delta)
+                            if candidate_mean < best_mean:
+                                best_mean = candidate_mean
+                                best_offset = (offset_x, offset_y)
+                    raise RuntimeError(
+                        "native viewport/full-input crop parity failed with "
+                        f"{differing} differing color bytes, "
+                        f"maximum delta {max(absolute)}, mean delta {statistics.fmean(absolute):.3f}; "
+                        f"best local crop offset {best_offset} has mean delta {best_mean:.3f}"
+                    )
+
+            xmp_path = root / "checkpoint.xmp"
+            request_id = str(uuid.uuid4())
+            write_frame(
+                process.stdin,
+                CHECKPOINT_XMP,
+                envelope(
+                    "session.checkpointXmp",
+                    request_id,
+                    session_id,
+                    {"revision": revision, "outputPath": str(xmp_path)},
+                ),
+            )
+            checkpoint, attachment = read_frame(process.stdout, ARTIFACT_WRITTEN)
+            if attachment:
+                raise RuntimeError("XMP response unexpectedly carried an attachment")
+            xmp = validate_artifact(checkpoint, xmp_path, "xmp")
+            if b"darktable:" not in xmp:
+                raise RuntimeError("checkpoint does not contain darktable XMP state")
+
+            jpeg_path = root / "full-resolution.jpg"
+            request_id = str(uuid.uuid4())
+            write_frame(
+                process.stdin,
+                EXPORT_JPEG,
+                envelope(
+                    "session.exportJpeg",
+                    request_id,
+                    session_id,
+                    {"revision": revision, "outputPath": str(jpeg_path)},
+                ),
+            )
+            exported, attachment = read_frame(process.stdout, ARTIFACT_WRITTEN)
+            if attachment:
+                raise RuntimeError("JPEG response unexpectedly carried an attachment")
+            jpeg = validate_artifact(exported, jpeg_path, "jpeg")
+            exported_dimensions = jpeg_dimensions(jpeg)
+            if exported_dimensions != source_dimensions:
+                raise RuntimeError(
+                    "JPEG export is not full-resolution: "
+                    f"expected {source_dimensions}, got {exported_dimensions}"
+                )
+
             request_id = str(uuid.uuid4())
             write_frame(
                 process.stdin,
@@ -580,6 +933,7 @@ def run(args: argparse.Namespace) -> int:
                 "workload": args.workload,
                 "seed": args.seed,
                 "surface": {"width": args.width, "height": args.height},
+                "overviewViewportColorDelta": overview_viewport_delta,
                 "exposureEV": {"low": args.low_ev, "high": args.high_ev},
                 "sequentialRender": {
                     "roundTripMilliseconds": metric_summary(round_trip_samples, args.seed),
@@ -624,7 +978,7 @@ def run(args: argparse.Namespace) -> int:
                     writer.writerows(sample_records)
             print(
                 f"PASS: {args.edits} edits/renders in one worker; "
-                f"coupling/reset verified; final revision={revision}; "
+                f"coupling/reset/ROI parity/XMP/full-resolution export verified; final revision={revision}; "
                 f"peak child RSS={peak_rss:.1f} MiB; "
                 f"RSS growth={growth_text}; "
                 f"sequential round-trip p50={report['sequentialRender']['roundTripMilliseconds']['p50']:.2f} ms, "
@@ -675,7 +1029,23 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="require the test image/state to exercise histogram bins 0 or 1023",
     )
+    parser.add_argument(
+        "--verify-native-roi-pixels",
+        action="store_true",
+        help="compare a centered 1:1 viewport byte-for-byte with a bounded full-source surface",
+    )
     parser.add_argument("--verbose-worker", action="store_true")
+    parser.add_argument(
+        "--verify-viewport-cancel",
+        action="store_true",
+        help="supersede one active native viewport render before the parity render",
+    )
+    parser.add_argument(
+        "--viewport-cancel-delay-ms",
+        type=float,
+        default=0.0,
+        help="delay after starting the cancellation fixture render (default: immediate)",
+    )
     parser.add_argument(
         "--worker-debug-perf",
         action="store_true",
@@ -705,6 +1075,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--capture-every must not be negative")
     if args.rss_sample_interval < 1:
         parser.error("--rss-sample-interval must be positive")
+    if args.viewport_cancel_delay_ms < 0:
+        parser.error("--viewport-cancel-delay-ms must not be negative")
     for name in ("width", "height", "max_long_edge"):
         if not 1 <= getattr(args, name) <= 2048:
             parser.error(f"--{name.replace('_', '-')} must be in 1...2048")

@@ -620,7 +620,8 @@ void dt_dev_process_image_job(dt_develop_t *dev,
     return;
   }
 
-  if(port == &dev->preview2 && !(port->widget && GTK_IS_WIDGET(port->widget)))
+  if(dev->gui_attached && port == &dev->preview2
+     && !(port->widget && GTK_IS_WIDGET(port->widget)))
   {
     return;
   }
@@ -642,9 +643,15 @@ void dt_dev_process_image_job(dt_develop_t *dev,
   dt_get_perf_times(&start);
 
   dt_mipmap_buffer_t buf;
+  // Preview pipes always use the reduced whole-image float mipmap, including
+  // GUI-neutral consumers that provide a viewport solely to bound their
+  // output dimensions. Full and secondary-preview canvas pipes retain the
+  // full-resolution input contract.
+  const gboolean reduced_preview_input = dt_pipe_is_preview(pipe);
   dt_mipmap_cache_get(&buf, dev->image_storage.id,
-                      port ? DT_MIPMAP_FULL     : DT_MIPMAP_F,
-                      port ? DT_MIPMAP_BLOCKING : DT_MIPMAP_BEST_EFFORT,
+                      reduced_preview_input ? DT_MIPMAP_F : DT_MIPMAP_FULL,
+                      reduced_preview_input && !port ? DT_MIPMAP_BEST_EFFORT
+                                                     : DT_MIPMAP_BLOCKING,
                       'r');
   dev->image_storage.load_status = buf.loader_status;
 
@@ -662,7 +669,7 @@ void dt_dev_process_image_job(dt_develop_t *dev,
   }
 
   dt_dev_pixelpipe_set_input(pipe, dev, (float *)buf.buf, buf.width, buf.height,
-                             port ? 1.0 : buf.iscale);
+                             reduced_preview_input ? buf.iscale : 1.0);
 
   // We require calculation of pixelpipe dimensions via dt_dev_pixelpipe_change() in these cases
   gboolean initial_change = pipe->loading || dev->image_force_reload || pipe->input_changed;
@@ -832,6 +839,14 @@ restart:
 
   if(stopped)
   {
+    if(shutdown == DT_DEV_PIXELPIPE_STOP_CANCEL)
+    {
+      dt_mipmap_cache_release(&buf);
+      dt_control_busy_leave();
+      pipe->status = DT_DEV_PIXELPIPE_INVALID;
+      dt_pthread_mutex_unlock(&pipe->mutex);
+      return;
+    }
     // In some cases we don't restart the pipe but exit with DT_DEV_PIXELPIPE_INVALID status, see _dev_pixelpipe_early_exit()
     const gboolean img_changed = dev->image_force_reload || pipe->loading || pipe->input_changed;
     if(img_changed)

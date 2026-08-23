@@ -216,6 +216,12 @@ const char *dt_remote_message_name(uint16_t type)
     return "session.describe";
   case DT_REMOTE_WORKER_SHUTDOWN:
     return "worker.shutdown";
+  case DT_REMOTE_SESSION_CHECKPOINT_XMP:
+    return "session.checkpointXmp";
+  case DT_REMOTE_SESSION_EXPORT_JPEG:
+    return "session.exportJpeg";
+  case DT_REMOTE_SURFACE_CANCEL:
+    return "surface.cancel";
   case DT_REMOTE_WORKER_CAPABILITIES:
     return "worker.capabilities";
   case DT_REMOTE_SESSION_OPENED:
@@ -224,6 +230,8 @@ const char *dt_remote_message_name(uint16_t type)
     return "session.exposureAccepted";
   case DT_REMOTE_SURFACE_RENDERED:
     return "surface.rendered";
+  case DT_REMOTE_ARTIFACT_WRITTEN:
+    return "artifact.written";
   case DT_REMOTE_WORKER_ERROR:
     return "worker.error";
   default:

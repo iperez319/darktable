@@ -12,11 +12,18 @@
 
 #include "common/colorspaces.h"
 #include "common/darktable.h"
+#include "common/exif.h"
 #include "common/film.h"
 #include "common/image.h"
 #include "develop/pixelpipe.h"
+#include "imageio/imageio_common.h"
+#include "imageio/imageio_module.h"
+#include "control/conf.h"
+#include "remote/remote_protocol.h"
 
 #include <errno.h>
+#include <math.h>
+#include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
 
@@ -101,6 +108,7 @@ void dt_remote_session_init(dt_remote_session_t *session)
   memset(session, 0, sizeof(*session));
   session->image_id = NO_IMGID;
   g_mutex_init(&session->mutex);
+  g_mutex_init(&session->viewport_cancel_mutex);
   session->initialized = TRUE;
 }
 
@@ -113,6 +121,10 @@ void dt_remote_session_cleanup(dt_remote_session_t *session)
   {
     session->dev.full.pipe->analysis_callback = NULL;
     session->dev.full.pipe->analysis_user_data = NULL;
+    session->dev.preview_pipe->analysis_callback = NULL;
+    session->dev.preview_pipe->analysis_user_data = NULL;
+    session->dev.preview2.pipe->analysis_callback = NULL;
+    session->dev.preview2.pipe->analysis_user_data = NULL;
     dt_remote_exposure_cleanup(&session->exposure);
     dt_dev_cleanup(&session->dev);
     if(dt_is_valid_imgid(session->image_id))
@@ -124,11 +136,15 @@ void dt_remote_session_cleanup(dt_remote_session_t *session)
   session->image_digest = session->state_digest = NULL;
   g_mutex_unlock(&session->mutex);
   g_mutex_clear(&session->mutex);
+  g_mutex_clear(&session->viewport_cancel_mutex);
   session->initialized = FALSE;
 }
 
 static gboolean _render_unlocked(dt_remote_session_t *session, uint64_t revision,
                                  uint64_t generation, uint32_t width, uint32_t height,
+                                 dt_remote_surface_role_t role,
+                                 dt_remote_normalized_rect_t coverage,
+                                 double source_pixels_per_output_pixel,
                                  dt_remote_surface_t *surface,
                                  dt_remote_render_timing_t *timing, char **error);
 
@@ -179,6 +195,9 @@ gboolean dt_remote_session_open(dt_remote_session_t *session, const char *image_
   darktable.color_profiles->display_type = DT_COLORSPACE_SRGB;
   darktable.color_profiles->display_filename[0] = '\0';
   darktable.color_profiles->display_intent = DT_INTENT_RELATIVE_COLORIMETRIC;
+  darktable.color_profiles->display2_type = DT_COLORSPACE_SRGB;
+  darktable.color_profiles->display2_filename[0] = '\0';
+  darktable.color_profiles->display2_intent = DT_INTENT_RELATIVE_COLORIMETRIC;
   darktable.color_profiles->mode = DT_PROFILE_NORMAL;
 
   dt_dev_init(&session->dev, FALSE);
@@ -192,11 +211,22 @@ gboolean dt_remote_session_open(dt_remote_session_t *session, const char *image_
   session->dev.full.color_assessment = FALSE;
   session->dev.full.dev = &session->dev;
   session->dev.preview2.dev = &session->dev;
+  session->overview.zoom = DT_ZOOM_FIT;
+  session->overview.width = maximum_long_edge;
+  session->overview.height = maximum_long_edge;
+  session->overview.ppd = 1.0;
+  session->overview.color_assessment = FALSE;
+  session->overview.dev = &session->dev;
+  session->overview.pipe = session->dev.preview_pipe;
   dt_dev_load_image(&session->dev, session->image_id);
   if(!dt_remote_exposure_init(&session->exposure, &session->dev, error))
     goto failed_dev;
   session->dev.full.pipe->analysis_callback = dt_remote_analysis_callback;
   session->dev.full.pipe->analysis_user_data = &session->analysis;
+  session->dev.preview_pipe->analysis_callback = dt_remote_analysis_callback;
+  session->dev.preview_pipe->analysis_user_data = &session->analysis;
+  session->dev.preview2.pipe->analysis_callback = dt_remote_analysis_callback;
+  session->dev.preview2.pipe->analysis_user_data = &session->analysis;
 
   session->maximum_long_edge = maximum_long_edge;
   session->epoch = (((uint64_t)g_get_real_time()) << 1) ^ (uint64_t)g_random_int();
@@ -209,13 +239,39 @@ gboolean dt_remote_session_open(dt_remote_session_t *session, const char *image_
 
   dt_remote_surface_t warm_surface;
   dt_remote_render_timing_t warm_timing = {0};
-  if(!_render_unlocked(session, 0, 0, maximum_long_edge, maximum_long_edge, &warm_surface,
-                       &warm_timing, error))
+  if(!_render_unlocked(session, 0, 0, maximum_long_edge, maximum_long_edge,
+                       DT_REMOTE_SURFACE_OVERVIEW,
+                       (dt_remote_normalized_rect_t){0.0, 0.0, 1.0, 1.0}, 1.0,
+                       &warm_surface, &warm_timing, error))
   {
     session->open = FALSE;
     dt_remote_exposure_cleanup(&session->exposure);
     goto failed_dev;
   }
+  const float input_scale = session->dev.full.pipe->iscale > 0.0f
+                                ? session->dev.full.pipe->iscale
+                                : 1.0f;
+  session->source_pixel_width = (uint32_t)llround(
+      (double)session->dev.full.pipe->processed_width / input_scale);
+  session->source_pixel_height = (uint32_t)llround(
+      (double)session->dev.full.pipe->processed_height / input_scale);
+  if(!session->source_pixel_width || !session->source_pixel_height)
+  {
+    _set_error(error, "could not determine developed source dimensions");
+    dt_remote_surface_clear(&warm_surface);
+    session->open = FALSE;
+    dt_remote_exposure_cleanup(&session->exposure);
+    goto failed_dev;
+  }
+  // Headless full-pipe initialization clears the preview loading flags before
+  // those pipes have created their module nodes. Prime both persistent remote
+  // roles explicitly so their first request performs the normal node setup.
+  session->dev.preview_pipe->loading = TRUE;
+  session->dev.preview_pipe->input_changed = TRUE;
+  session->dev.preview_pipe->changed |= DT_DEV_PIPE_SYNCH;
+  session->dev.preview2.pipe->loading = TRUE;
+  session->dev.preview2.pipe->input_changed = TRUE;
+  session->dev.preview2.pipe->changed |= DT_DEV_PIPE_SYNCH;
   dt_remote_surface_clear(&warm_surface);
   ok = TRUE;
   goto done;
@@ -235,11 +291,12 @@ done:
 static gboolean _validate_generation(const dt_remote_session_t *session, uint64_t generation,
                                      char **error)
 {
-  if(generation <= session->desired_generation)
-  {
-    _set_error(error, "generation must be greater than the current desired generation");
-    return FALSE;
-  }
+  // The trusted gateway serializes public intents and owns ordering. The
+  // worker generation is correlation metadata, not a second durable clock;
+  // allowing replay is required for historical comparison and reconstruction.
+  (void)session;
+  (void)generation;
+  (void)error;
   return TRUE;
 }
 
@@ -292,6 +349,9 @@ gboolean dt_remote_session_reset_exposure(dt_remote_session_t *session, uint64_t
 
 static gboolean _render_unlocked(dt_remote_session_t *session, uint64_t revision,
                                  uint64_t generation, uint32_t width, uint32_t height,
+                                 dt_remote_surface_role_t role,
+                                 dt_remote_normalized_rect_t coverage,
+                                 double source_pixels_per_output_pixel,
                                  dt_remote_surface_t *surface,
                                  dt_remote_render_timing_t *timing, char **error)
 {
@@ -304,28 +364,141 @@ static gboolean _render_unlocked(dt_remote_session_t *session, uint64_t revision
     _set_error(error, "session is not open");
     return FALSE;
   }
-  if(revision != session->revision || generation != session->desired_generation)
+  if(revision != session->revision)
   {
-    _set_error(error, "render revision or generation is not current");
+    _set_error(error, "render revision is not current");
     return FALSE;
   }
-  if(width == 0 || height == 0 || width > session->maximum_long_edge ||
-     height > session->maximum_long_edge)
+  if(width == 0 || height == 0 || width > 4096 || height > 4096 ||
+     (uint64_t)width * (uint64_t)height * 4u > DT_REMOTE_MAX_ATTACHMENT_BYTES)
   {
-    _set_error(error, "render dimensions exceed the negotiated maximum");
+    _set_error(error, "render dimensions exceed the bounded surface maximum");
     return FALSE;
   }
-  session->dev.full.width = (int)width;
-  session->dev.full.height = (int)height;
-  session->dev.full.pipe->changed |= DT_DEV_PIPE_ZOOMED;
-  dt_dev_invalidate_all(&session->dev);
+  if(!isfinite(source_pixels_per_output_pixel) || source_pixels_per_output_pixel < 1.0 ||
+     !isfinite(coverage.x) || !isfinite(coverage.y) || !isfinite(coverage.width) ||
+     !isfinite(coverage.height) || coverage.x < 0.0 || coverage.y < 0.0 ||
+     coverage.width <= 0.0 || coverage.height <= 0.0 ||
+     coverage.x + coverage.width > 1.000001 || coverage.y + coverage.height > 1.000001)
+  {
+    _set_error(error, "render coverage or scale is invalid");
+    return FALSE;
+  }
+
+  const gboolean bootstrapping = role != DT_REMOTE_SURFACE_VIEWPORT
+                                 && !session->source_pixel_width;
+  dt_dev_viewport_t *port = role == DT_REMOTE_SURFACE_VIEWPORT
+                                ? &session->dev.preview2
+                                : (bootstrapping ? &session->dev.full : &session->overview);
+  dt_dev_pixelpipe_t *pipe = port->pipe;
+  uint32_t crop_x = 0, crop_y = 0, crop_width = 0, crop_height = 0;
+  port->width = (int)width;
+  port->height = (int)height;
+  port->ppd = 1.0;
+  port->dev = &session->dev;
+  if(role == DT_REMOTE_SURFACE_VIEWPORT)
+  {
+    // The current RAW + Exposure stack does not produce byte-identical output
+    // for an independently processed tile. Follow the conservative correctness
+    // policy: process the whole developed image at the requested native-or-
+    // reduced scale, then crop the completed display buffer. Pixelpipe caches
+    // remain persistent, and no seam-prone tile is marked authoritative.
+    const double scale = 1.0 / source_pixels_per_output_pixel;
+    const uint32_t full_width = MAX(1u, (uint32_t)floor(session->source_pixel_width * scale));
+    const uint32_t full_height = MAX(1u, (uint32_t)floor(session->source_pixel_height * scale));
+    crop_width = MIN(width, full_width);
+    crop_height = MIN(height, full_height);
+    const double center_x = full_width * (coverage.x + coverage.width * 0.5);
+    const double center_y = full_height * (coverage.y + coverage.height * 0.5);
+    const int64_t desired_x = (int64_t)(center_x - crop_width / 2u);
+    const int64_t desired_y = (int64_t)(center_y - crop_height / 2u);
+    crop_x = (uint32_t)CLAMP(desired_x, 0, (int64_t)full_width - crop_width);
+    crop_y = (uint32_t)CLAMP(desired_y, 0, (int64_t)full_height - crop_height);
+    // dt_dev_process_image_job() adds a one-pixel movement guard on every
+    // viewport edge. Counter it so the completed backbuffer is exactly the
+    // full scaled image before the authoritative post-process crop.
+    port->width = full_width > 2 ? (int)full_width - 2 : (int)full_width;
+    port->height = full_height > 2 ? (int)full_height - 2 : (int)full_height;
+    port->zoom = DT_ZOOM_FREE;
+    port->zoom_scale = (float)scale;
+    port->closeup = 0;
+    dt_dev_zoom_move(port, DT_ZOOM_POSITION, 0.0f, 0, 0.0f, 0.0f, TRUE);
+  }
+  else
+  {
+    port->width = (int)width;
+    port->height = (int)height;
+    port->zoom = DT_ZOOM_FIT;
+    port->zoom_x = port->zoom_y = 0.0f;
+    port->closeup = 0;
+  }
+  pipe->changed |= DT_DEV_PIPE_ZOOMED;
   dt_remote_analysis_prepare(&session->analysis, revision, generation);
+  if(role == DT_REMOTE_SURFACE_VIEWPORT)
+  {
+    dt_remote_analysis_crop(&session->analysis, crop_x, crop_y, crop_width, crop_height);
+    g_mutex_lock(&session->viewport_cancel_mutex);
+    session->active_viewport_generation = generation;
+    const gboolean canceled_before_start =
+        session->pending_viewport_cancel_generation == generation;
+    if(canceled_before_start)
+    {
+      session->active_viewport_generation = 0;
+      session->pending_viewport_cancel_generation = 0;
+    }
+    else if(session->pending_viewport_cancel_generation < generation)
+      session->pending_viewport_cancel_generation = 0;
+    g_mutex_unlock(&session->viewport_cancel_mutex);
+    if(canceled_before_start)
+    {
+      _set_error(error, "render superseded");
+      return FALSE;
+    }
+  }
   const gint64 start = g_get_monotonic_time();
-  dt_dev_process_image_job(&session->dev, &session->dev.full, session->dev.full.pipe,
-                           (dt_signal_t)-1, session->dev.full.pipe->devid);
+  dt_dev_process_image_job(&session->dev, port, pipe, (dt_signal_t)-1, pipe->devid);
   if(timing)
     timing->pixelpipe_ms = (double)(g_get_monotonic_time() - start) / 1000.0;
-  if(!dt_remote_surface_from_pipe(session->dev.full.pipe, surface, timing, error))
+  if(role == DT_REMOTE_SURFACE_VIEWPORT)
+  {
+    g_mutex_lock(&session->viewport_cancel_mutex);
+    const gboolean canceled = session->pending_viewport_cancel_generation == generation;
+    if(canceled)
+    {
+      session->active_viewport_generation = 0;
+      session->pending_viewport_cancel_generation = 0;
+    }
+    g_mutex_unlock(&session->viewport_cancel_mutex);
+    if(canceled)
+    {
+      _set_error(error, "render superseded");
+      return FALSE;
+    }
+  }
+  const gboolean surface_ok = role == DT_REMOTE_SURFACE_VIEWPORT
+                                  ? dt_remote_surface_region_from_pipe(
+                                        pipe, crop_x, crop_y, crop_width, crop_height,
+                                        surface, timing, error)
+                                  : dt_remote_surface_from_pipe(pipe, surface, timing, error);
+  gboolean canceled = FALSE;
+  if(role == DT_REMOTE_SURFACE_VIEWPORT)
+  {
+    g_mutex_lock(&session->viewport_cancel_mutex);
+    canceled = session->pending_viewport_cancel_generation == generation;
+    if(session->active_viewport_generation == generation)
+      session->active_viewport_generation = 0;
+    if(canceled)
+      session->pending_viewport_cancel_generation = 0;
+    g_mutex_unlock(&session->viewport_cancel_mutex);
+  }
+  if(canceled)
+  {
+    if(surface_ok)
+      dt_remote_surface_clear(surface);
+    _set_error(error, "render superseded");
+    return FALSE;
+  }
+  if(!surface_ok)
     return FALSE;
   const gint64 analysis_start = g_get_monotonic_time();
   if(!dt_remote_analysis_finalize(&session->analysis, session->state_digest,
@@ -341,6 +514,9 @@ static gboolean _render_unlocked(dt_remote_session_t *session, uint64_t revision
 
 gboolean dt_remote_session_render(dt_remote_session_t *session, uint64_t revision,
                                   uint64_t generation, uint32_t width, uint32_t height,
+                                  dt_remote_surface_role_t role,
+                                  dt_remote_normalized_rect_t coverage,
+                                  double source_pixels_per_output_pixel,
                                   dt_remote_surface_t *surface,
                                   dt_remote_render_timing_t *timing, char **error)
 {
@@ -348,9 +524,32 @@ gboolean dt_remote_session_render(dt_remote_session_t *session, uint64_t revisio
     *error = NULL;
   g_mutex_lock(&session->mutex);
   const gboolean ok =
-      _render_unlocked(session, revision, generation, width, height, surface, timing, error);
+      _render_unlocked(session, revision, generation, width, height, role, coverage,
+                       source_pixels_per_output_pixel, surface, timing, error);
   g_mutex_unlock(&session->mutex);
   return ok;
+}
+
+void dt_remote_session_cancel_viewport(dt_remote_session_t *session, uint64_t generation)
+{
+  if(!session || !generation)
+    return;
+  g_mutex_lock(&session->viewport_cancel_mutex);
+  const uint64_t active_generation = session->active_viewport_generation;
+  if(generation > session->pending_viewport_cancel_generation)
+    session->pending_viewport_cancel_generation = generation;
+  const gboolean signaled = session->active_viewport_generation == generation
+                            && session->dev.preview2.pipe;
+  if(signaled)
+    dt_dev_pixelpipe_set_shutdown(session->dev.preview2.pipe, DT_DEV_PIXELPIPE_STOP_CANCEL);
+  fprintf(stderr,
+          "{\"component\":\"worker\",\"event\":\"viewportCancelApplied\","
+          "\"generation\":%" G_GUINT64_FORMAT ",\"activeGeneration\":%"
+          G_GUINT64_FORMAT ",\"pendingGeneration\":%" G_GUINT64_FORMAT
+          ",\"pixelpipeSignaled\":%s}\n",
+          generation, active_generation, session->pending_viewport_cancel_generation,
+          signaled ? "true" : "false");
+  g_mutex_unlock(&session->viewport_cancel_mutex);
 }
 
 void dt_remote_session_current_values(const dt_remote_session_t *session, float *exposure_ev,
@@ -363,4 +562,67 @@ void dt_remote_session_baseline_values(const dt_remote_session_t *session, float
                                        float *black)
 {
   dt_remote_exposure_values(&session->exposure, session->exposure.baseline, exposure_ev, black);
+}
+
+gboolean dt_remote_session_checkpoint_xmp(dt_remote_session_t *session, const char *path,
+                                          char **error)
+{
+  if(error) *error = NULL;
+  g_mutex_lock(&session->mutex);
+  gboolean ok = FALSE;
+  if(!session->open || !path || !*path)
+    _set_error(error, "session or XMP destination is invalid");
+  else
+  {
+    dt_dev_write_history_ext(&session->dev, session->image_id);
+    if(dt_exif_xmp_write(session->image_id, path, TRUE))
+      _set_error(error, "darktable could not materialize XMP");
+    else
+      ok = TRUE;
+  }
+  g_mutex_unlock(&session->mutex);
+  return ok;
+}
+
+gboolean dt_remote_session_export_jpeg(dt_remote_session_t *session, const char *path,
+                                       char **error)
+{
+  if(error) *error = NULL;
+  g_mutex_lock(&session->mutex);
+  gboolean ok = FALSE;
+  if(!session->open || !path || !*path)
+  {
+    _set_error(error, "session or export destination is invalid");
+    goto done;
+  }
+  dt_dev_write_history_ext(&session->dev, session->image_id);
+  dt_imageio_module_format_t *format = dt_imageio_get_format_by_name("jpeg");
+  if(!format)
+  {
+    _set_error(error, "JPEG format module is unavailable");
+    goto done;
+  }
+  dt_conf_set_int("plugins/imageio/format/jpeg/quality", 95);
+  dt_conf_set_int("plugins/imageio/format/jpeg/subsample", 1);
+  dt_imageio_module_data_t *params = format->get_params(format);
+  if(!params)
+  {
+    _set_error(error, "JPEG format parameters are unavailable");
+    goto done;
+  }
+  params->max_width = 0;
+  params->max_height = 0;
+  params->style[0] = '\0';
+  params->style_append = TRUE;
+  const gboolean failed = dt_imageio_export(
+      session->image_id, path, format, params, TRUE, FALSE, FALSE, 1.0, TRUE, TRUE,
+      DT_COLORSPACE_SRGB, NULL, DT_INTENT_RELATIVE_COLORIMETRIC, NULL, NULL, 1, 1, NULL);
+  format->free_params(format, params);
+  if(failed)
+    _set_error(error, "darktable full-resolution JPEG export failed");
+  else
+    ok = TRUE;
+done:
+  g_mutex_unlock(&session->mutex);
+  return ok;
 }

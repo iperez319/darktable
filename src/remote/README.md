@@ -1,24 +1,30 @@
 # Persistent remote worker
 
 `darktable-remote-worker` is the GPL-linked, single-image engine process for the
-Exposure + Histogram MVP. It has no listener. A trusted gateway owns the child
-process and exchanges the frozen `DTRW` v1 frames over stdin/stdout; diagnostics
+Editor Foundation milestone. It has no listener. A trusted gateway owns the child
+process and exchanges `DTRW` v2 frames over stdin/stdout; diagnostics
 go only to stderr.
 
 WP2 and WP3 provide:
 
-- one in-memory image import and one persistent `dt_develop_t` with full,
-  preview, and preview2 pipes;
+- one in-memory image import and one persistent `dt_develop_t` with reduced
+  overview and full-input viewport pipes; the viewport currently processes the
+  full scaled image and crops afterward because the direct-tile parity fixture
+  has not passed for the initial RAW stack;
 - introspection-checked Exposure v7 state, full-blob baseline/reset semantics,
   intent-aware Exposure/Black coupling, and deterministic state digests;
 - serialized revision/generation mutation and rendering;
+- a generation-scoped, one-way cancellation path that atomically stops a
+  superseded viewport pixelpipe while leaving its replacement and session state
+  intact;
 - checked, mutex-protected backbuffer snapshots normalized to tight, top-first,
   opaque BGRA8 attachments with SHA-256 integrity;
 - a GUI-neutral callback over the final host float buffer before gamma packing,
   with a 1,024-bin RGB histogram computed by `dt_histogram_helper`;
 - retry-safe histogram replacement plus revision, generation, profile, sampled
   pixel, timing, and pixelpipe-result-digest binding;
-- exact framed reads/writes and frozen input/allocation limits.
+- XMP checkpoint and fixed full-resolution JPEG export from reconstructed state;
+- exact framed reads/writes and bounded input/allocation limits.
 
 `surface.rendered.histogram` uses the frozen
 `display-referred-float-pre-pack-v1` domain. Its RGB arrays each contain 1,024
@@ -52,7 +58,16 @@ histograms, and bounded RSS. It also proves that a rejected out-of-range
 mutation changes neither the revision nor the generation by successfully
 reusing that generation afterward, checks deterministic repeated-state digests
 and Exposure-driven Black coupling, and verifies that reset restores the
-complete baseline blob digest.
+complete baseline blob digest. It also checks overview/viewport state,
+geometry, and output-contract compatibility, records the expected color delta
+between reduced and full inputs, and verifies a true 1:1 viewport ROI, XMP
+integrity, and full-developed-dimension JPEG export. Add
+`--verify-native-roi-pixels` to compare the viewport bytes exactly with a crop
+from a complete native-scale render. Add `--verify-viewport-cancel` to stop an
+active native viewport immediately, verify its correlated `render_superseded`
+result (including the pre-pixelpipe cancellation race), and then prove the same
+worker can render the replacement. Use `--viewport-cancel-delay-ms` to exercise
+cancellation later in the pixelpipe as well.
 
 The worker now reports separate `snapshot`, `normalize`, `digest`, and
 `analysis` spans while retaining aggregate `surfaceCopy` compatibility. It

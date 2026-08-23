@@ -25,6 +25,10 @@ typedef struct dt_remote_analysis_t
   uint32_t height;
   uint32_t sampled_pixels;
   uint32_t callback_invocations;
+  uint32_t crop_x;
+  uint32_t crop_y;
+  uint32_t crop_width;
+  uint32_t crop_height;
   uint32_t red[DT_REMOTE_HISTOGRAM_BINS];
   uint32_t green[DT_REMOTE_HISTOGRAM_BINS];
   uint32_t blue[DT_REMOTE_HISTOGRAM_BINS];
@@ -38,6 +42,8 @@ typedef struct dt_remote_analysis_t
 
 void dt_remote_analysis_prepare(dt_remote_analysis_t *analysis, uint64_t revision,
                                 uint64_t generation);
+void dt_remote_analysis_crop(dt_remote_analysis_t *analysis, uint32_t x, uint32_t y,
+                             uint32_t width, uint32_t height);
 void dt_remote_analysis_callback(void *user_data, const float *input, int width, int height,
                                  dt_iop_colorspace_type_t colorspace,
                                  const struct dt_iop_order_iccprofile_info_t *profile_info);

@@ -41,6 +41,15 @@ void dt_remote_analysis_prepare(dt_remote_analysis_t *analysis, uint64_t revisio
   analysis->generation = generation;
 }
 
+void dt_remote_analysis_crop(dt_remote_analysis_t *analysis, uint32_t x, uint32_t y,
+                             uint32_t width, uint32_t height)
+{
+  analysis->crop_x = x;
+  analysis->crop_y = y;
+  analysis->crop_width = width;
+  analysis->crop_height = height;
+}
+
 void dt_remote_analysis_callback(void *user_data, const float *input, int width, int height,
                                  dt_iop_colorspace_type_t colorspace,
                                  const dt_iop_order_iccprofile_info_t *profile_info)
@@ -53,10 +62,18 @@ void dt_remote_analysis_callback(void *user_data, const float *input, int width,
   const uint32_t invocation = analysis->callback_invocations + 1;
   const uint64_t revision = analysis->revision;
   const uint64_t generation = analysis->generation;
+  const uint32_t crop_x = analysis->crop_x;
+  const uint32_t crop_y = analysis->crop_y;
+  const uint32_t crop_width = analysis->crop_width;
+  const uint32_t crop_height = analysis->crop_height;
   memset(analysis, 0, sizeof(*analysis));
   analysis->revision = revision;
   analysis->generation = generation;
   analysis->callback_invocations = invocation;
+  analysis->crop_x = crop_x;
+  analysis->crop_y = crop_y;
+  analysis->crop_width = crop_width;
+  analysis->crop_height = crop_height;
 
   if(!input || width <= 0 || height <= 0)
   {
@@ -79,13 +96,20 @@ void dt_remote_analysis_callback(void *user_data, const float *input, int width,
     goto done;
   }
 
+  const gboolean cropped = crop_width && crop_height;
+  if(cropped && ((uint64_t)crop_x + crop_width > (uint64_t)width ||
+                 (uint64_t)crop_y + crop_height > (uint64_t)height))
+  {
+    _analysis_error(analysis, "pre-gamma histogram crop is outside the completed buffer");
+    goto done;
+  }
   const dt_histogram_roi_t roi = {
       .width = width,
       .height = height,
-      .crop_x = 0,
-      .crop_y = 0,
-      .crop_right = 0,
-      .crop_bottom = 0,
+      .crop_x = cropped ? crop_x : 0,
+      .crop_y = cropped ? crop_y : 0,
+      .crop_right = cropped ? (uint32_t)width - crop_x - crop_width : 0,
+      .crop_bottom = cropped ? (uint32_t)height - crop_y - crop_height : 0,
   };
   dt_dev_histogram_collection_params_t params = {
       .roi = &roi,
@@ -97,7 +121,8 @@ void dt_remote_analysis_callback(void *user_data, const float *input, int width,
   dt_histogram_helper(&params, &stats, IOP_CS_RGB, IOP_CS_RGB, input, &interleaved, maximum, FALSE,
                       profile_info);
   if(!interleaved || stats.bins_count != DT_REMOTE_HISTOGRAM_BINS || stats.ch != 3 ||
-     stats.pixels != (uint32_t)width * (uint32_t)height)
+     stats.pixels != (cropped ? crop_width * crop_height
+                              : (uint32_t)width * (uint32_t)height))
   {
     if(interleaved)
       dt_free_align(interleaved);
@@ -112,8 +137,8 @@ void dt_remote_analysis_callback(void *user_data, const float *input, int width,
     analysis->blue[bin] = interleaved[bin * 4 + 2];
   }
   dt_free_align(interleaved);
-  analysis->width = (uint32_t)width;
-  analysis->height = (uint32_t)height;
+  analysis->width = cropped ? crop_width : (uint32_t)width;
+  analysis->height = cropped ? crop_height : (uint32_t)height;
   analysis->sampled_pixels = stats.pixels;
   analysis->profile_type = profile_info->type;
   analysis->profile_intent = profile_info->intent;

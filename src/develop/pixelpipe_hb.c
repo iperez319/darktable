@@ -119,6 +119,7 @@ const char *dt_dev_pixelpipe_shutdown_to_str(const dt_dev_pixelpipe_stopper_t st
   case DT_DEV_PIXELPIPE_STOP_ZOOM:  return "DT_DEV_PIXELPIPE_STOP_ZOOM";
   case DT_DEV_PIXELPIPE_STOP_DATA:  return "DT_DEV_PIXELPIPE_STOP_DATA";
   case DT_DEV_PIXELPIPE_STOP_PIECE: return "DT_DEV_PIXELPIPE_STOP_PIECE";
+  case DT_DEV_PIXELPIPE_STOP_CANCEL: return "DT_DEV_PIXELPIPE_STOP_CANCEL";
   default:                          return "DT_DEV_PIXELPIPE_STOP_UNDEFINED";
   }
 }
@@ -1505,6 +1506,9 @@ static inline dt_dev_pixelpipe_stopper_t _module_pipe_stop(dt_dev_pixelpipe_t *p
       dt_dev_pixelpipe_shutdown_to_str(stopper));
 
   dt_dev_pixelpipe_invalidate_cacheline(pipe, outcacheline, NULL);
+
+  if(stopper == DT_DEV_PIXELPIPE_STOP_CANCEL)
+    return stopper;
 
   if(simple)
     return stopper;

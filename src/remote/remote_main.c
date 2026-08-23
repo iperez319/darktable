@@ -16,6 +16,8 @@
 #include <glib.h>
 #include <glib/gi18n.h>
 #include <limits.h>
+#include <math.h>
+#include <poll.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -25,6 +27,20 @@
 #endif
 
 static const gchar *_benchmark_run_id = NULL;
+
+typedef struct dt_remote_input_t
+{
+  dt_remote_read_result_t result;
+  dt_remote_frame_t frame;
+  GError *error;
+} dt_remote_input_t;
+
+typedef struct dt_remote_reader_t
+{
+  GAsyncQueue *queue;
+  dt_remote_session_t *session;
+  gint stop;
+} dt_remote_reader_t;
 
 static gboolean _has_flag(char **argv, int argc, const char *flag)
 {
@@ -105,6 +121,69 @@ static gboolean _get_uint64(JsonObject *object, const char *name, uint64_t *valu
   return TRUE;
 }
 
+static gboolean _cancel_generation(const dt_remote_frame_t *frame, uint64_t *generation)
+{
+  if(frame->type != DT_REMOTE_SURFACE_CANCEL || frame->attachment_size ||
+     !frame->json || !JSON_NODE_HOLDS_OBJECT(frame->json))
+    return FALSE;
+  JsonObject *request = json_node_get_object(frame->json);
+  const char *type = json_object_has_member(request, "type")
+                         ? json_object_get_string_member(request, "type")
+                         : NULL;
+  JsonObject *body = _request_body(request);
+  return type && !strcmp(type, "surface.cancel") && body &&
+         _get_uint64(body, "generation", generation) && *generation > 0;
+}
+
+static gpointer _read_worker_input(gpointer user_data)
+{
+  dt_remote_reader_t *reader = (dt_remote_reader_t *)user_data;
+  while(!g_atomic_int_get(&reader->stop))
+  {
+    struct pollfd descriptor = { STDIN_FILENO, POLLIN, 0 };
+    const int ready = poll(&descriptor, 1, 100);
+    if(ready == 0)
+      continue;
+    if(ready < 0)
+    {
+      if(errno == EINTR)
+        continue;
+      dt_remote_input_t *input = g_malloc0(sizeof(*input));
+      input->result = DT_REMOTE_READ_ERROR;
+      input->error = g_error_new(g_quark_from_static_string("dt-remote-input"), errno,
+                                 "poll failed: %s", g_strerror(errno));
+      g_async_queue_push(reader->queue, input);
+      break;
+    }
+    dt_remote_input_t *input = g_malloc0(sizeof(*input));
+    input->result = dt_remote_frame_read(stdin, &input->frame, &input->error);
+    if(input->result == DT_REMOTE_READ_OK && input->frame.type == DT_REMOTE_SURFACE_CANCEL)
+    {
+      uint64_t generation = 0;
+      if(_cancel_generation(&input->frame, &generation))
+      {
+        fprintf(stderr,
+                "{\"component\":\"worker\",\"event\":\"viewportCancelReceived\","
+                "\"generation\":%" G_GUINT64_FORMAT "}\n",
+                generation);
+        dt_remote_session_cancel_viewport(reader->session, generation);
+      }
+      else
+        fprintf(stderr, "darktable-remote-worker: invalid surface.cancel ignored\n");
+      dt_remote_frame_clear(&input->frame);
+      g_clear_error(&input->error);
+      g_free(input);
+      continue;
+    }
+    const gboolean terminal = input->result != DT_REMOTE_READ_OK ||
+                              input->frame.type == DT_REMOTE_WORKER_SHUTDOWN;
+    g_async_queue_push(reader->queue, input);
+    if(terminal)
+      break;
+  }
+  return NULL;
+}
+
 static gboolean _get_uint32(JsonObject *object, const char *name, uint32_t *value)
 {
   uint64_t number = 0;
@@ -112,6 +191,30 @@ static gboolean _get_uint32(JsonObject *object, const char *name, uint32_t *valu
     return FALSE;
   *value = (uint32_t)number;
   return TRUE;
+}
+
+static gboolean _get_double(JsonObject *object, const char *name, double *value)
+{
+  if(!object || !json_object_has_member(object, name))
+    return FALSE;
+  JsonNode *node = json_object_get_member(object, name);
+  if(!JSON_NODE_HOLDS_VALUE(node))
+    return FALSE;
+  *value = json_node_get_double(node);
+  return isfinite(*value);
+}
+
+static gboolean _get_normalized_rect(JsonObject *body, dt_remote_normalized_rect_t *rect)
+{
+  if(!json_object_has_member(body, "normalizedRect"))
+    return FALSE;
+  JsonNode *node = json_object_get_member(body, "normalizedRect");
+  if(!JSON_NODE_HOLDS_OBJECT(node))
+    return FALSE;
+  JsonObject *object = json_node_get_object(node);
+  return _get_double(object, "x", &rect->x) && _get_double(object, "y", &rect->y) &&
+         _get_double(object, "width", &rect->width) &&
+         _get_double(object, "height", &rect->height);
 }
 
 static JsonObject *_values_object(float exposure_ev, float black)
@@ -144,6 +247,36 @@ static JsonObject *_histogram_object(const dt_remote_analysis_t *analysis)
   json_object_set_string_member(histogram, "sourcePixelpipeResultDigest",
                                 analysis->pixelpipe_result_digest);
   return histogram;
+}
+
+static JsonNode *_artifact_written(JsonObject *request, const char *kind, const char *path)
+{
+  FILE *file = g_fopen(path, "rb");
+  if(!file) return NULL;
+  GChecksum *checksum = g_checksum_new(G_CHECKSUM_SHA256);
+  guint8 buffer[65536];
+  uint64_t size = 0;
+  size_t count = 0;
+  while((count = fread(buffer, 1, sizeof(buffer), file)) > 0)
+  {
+    g_checksum_update(checksum, buffer, count);
+    size += count;
+  }
+  const gboolean valid = !ferror(file);
+  fclose(file);
+  if(!valid)
+  {
+    g_checksum_free(checksum);
+    return NULL;
+  }
+  JsonObject *body = json_object_new();
+  json_object_set_string_member(body, "kind", kind);
+  json_object_set_int_member(body, "bytes", (gint64)size);
+  char *digest = g_strdup_printf("sha256:%s", g_checksum_get_string(checksum));
+  json_object_set_string_member(body, "digest", digest);
+  g_free(digest);
+  g_checksum_free(checksum);
+  return _envelope(request, "artifact.written", body);
 }
 
 static JsonNode *_capabilities(JsonObject *request)
@@ -187,6 +320,8 @@ static JsonNode *_session_description(JsonObject *request, const dt_remote_sessi
   json_object_set_int_member(body, "revision", (gint64)session->revision);
   json_object_set_int_member(body, "desiredGeneration", (gint64)session->desired_generation);
   json_object_set_string_member(body, "stateDigest", session->state_digest);
+  json_object_set_int_member(body, "sourcePixelWidth", session->source_pixel_width);
+  json_object_set_int_member(body, "sourcePixelHeight", session->source_pixel_height);
   return _envelope(request, "session.opened", body);
 }
 
@@ -302,13 +437,54 @@ static gboolean _handle(FILE *output, dt_remote_session_t *session, const dt_rem
     return _send(output, DT_REMOTE_SESSION_EXPOSURE_ACCEPTED,
                  _envelope(request, "session.exposureAccepted", response), NULL, 0);
   }
+  if(frame->type == DT_REMOTE_SESSION_CHECKPOINT_XMP ||
+     frame->type == DT_REMOTE_SESSION_EXPORT_JPEG)
+  {
+    const char *path = json_object_has_member(body, "outputPath")
+                           ? json_object_get_string_member(body, "outputPath")
+                           : NULL;
+    uint64_t revision = 0;
+    if(!path || !*path || !_get_uint64(body, "revision", &revision) || revision != session->revision)
+      return _send_error(output, request, "protocol_error", "invalid artifact request");
+    char *error = NULL;
+    const gboolean xmp = frame->type == DT_REMOTE_SESSION_CHECKPOINT_XMP;
+    const gboolean ok = xmp ? dt_remote_session_checkpoint_xmp(session, path, &error)
+                            : dt_remote_session_export_jpeg(session, path, &error);
+    if(!ok)
+    {
+      const gboolean sent = _send_error(output, request, "artifact_failed", error);
+      g_free(error);
+      return sent;
+    }
+    JsonNode *response = _artifact_written(request, xmp ? "xmp" : "jpeg", path);
+    if(!response)
+      return _send_error(output, request, "artifact_failed", "could not verify artifact");
+    return _send(output, DT_REMOTE_ARTIFACT_WRITTEN, response, NULL, 0);
+  }
   if(frame->type == DT_REMOTE_SURFACE_RENDER)
   {
     uint64_t revision = 0, public_revision = 0, session_epoch = 0, generation = 0;
-    uint32_t width = 0, height = 0;
+    uint32_t width = 0, height = 0, overscan_pixels = 0;
+    double source_pixels_per_output_pixel = 0.0;
+    dt_remote_normalized_rect_t coverage = {0};
     if(!_get_uint64(body, "revision", &revision) || !_get_uint64(body, "generation", &generation) ||
-       !_get_uint32(body, "width", &width) || !_get_uint32(body, "height", &height))
+       !_get_uint32(body, "width", &width) || !_get_uint32(body, "height", &height) ||
+       !_get_uint32(body, "overscanPixels", &overscan_pixels) ||
+       !_get_double(body, "sourcePixelsPerOutputPixel", &source_pixels_per_output_pixel) ||
+       !_get_normalized_rect(body, &coverage) || !json_object_has_member(body, "role"))
       return _send_error(output, request, "protocol_error", "invalid render request");
+    if(overscan_pixels > 256)
+      return _send_error(output, request, "protocol_error", "invalid viewport overscan");
+    const char *role_name = json_object_get_string_member(body, "role");
+    dt_remote_surface_role_t role;
+    if(!strcmp(role_name, "overview"))
+      role = DT_REMOTE_SURFACE_OVERVIEW;
+    else if(!strcmp(role_name, "viewport"))
+      role = DT_REMOTE_SURFACE_VIEWPORT;
+    else if(!strcmp(role_name, "baseline"))
+      role = DT_REMOTE_SURFACE_BASELINE;
+    else
+      return _send_error(output, request, "protocol_error", "invalid surface role");
     const gboolean has_public_identity =
         _get_uint64(body, "publicRevision", &public_revision) &&
         _get_uint64(body, "sessionEpoch", &session_epoch);
@@ -318,10 +494,26 @@ static gboolean _handle(FILE *output, dt_remote_session_t *session, const dt_rem
     dt_remote_surface_t surface;
     dt_remote_render_timing_t render_timing = {0};
     char *error = NULL;
-    if(!dt_remote_session_render(session, revision, generation, width, height, &surface,
-                                 &render_timing, &error))
+    const gint64 render_start = g_get_monotonic_time();
+    fprintf(stderr,
+            "{\"component\":\"worker\",\"event\":\"renderStart\",\"revision\":%"
+            G_GUINT64_FORMAT ",\"generation\":%" G_GUINT64_FORMAT
+            ",\"role\":\"%s\",\"width\":%u,\"height\":%u,"
+            "\"sourcePixelsPerOutputPixel\":%.9f}\n",
+            revision, generation, role_name, width, height, source_pixels_per_output_pixel);
+    if(!dt_remote_session_render(session, revision, generation, width, height, role, coverage,
+                                 source_pixels_per_output_pixel, &surface, &render_timing, &error))
     {
-      const gboolean sent = _send_error(output, request, "render_failed", error);
+      const char *code = error && !strcmp(error, "render superseded")
+                             ? "render_superseded"
+                             : "render_failed";
+      fprintf(stderr,
+              "{\"component\":\"worker\",\"event\":\"renderFailed\",\"revision\":%"
+              G_GUINT64_FORMAT ",\"generation\":%" G_GUINT64_FORMAT
+              ",\"role\":\"%s\",\"code\":\"%s\",\"durationMs\":%.6f}\n",
+              revision, generation, role_name, code,
+              (double)(g_get_monotonic_time() - render_start) / 1000.0);
+      const gboolean sent = _send_error(output, request, code, error);
       g_free(error);
       return sent;
     }
@@ -329,6 +521,15 @@ static gboolean _handle(FILE *output, dt_remote_session_t *session, const dt_rem
     json_object_set_int_member(response, "sessionEpoch", (gint64)session->epoch);
     json_object_set_int_member(response, "revision", (gint64)revision);
     json_object_set_int_member(response, "generation", (gint64)generation);
+    json_object_set_string_member(response, "role", role_name);
+    JsonObject *coverage_object = json_object_new();
+    json_object_set_double_member(coverage_object, "x", coverage.x);
+    json_object_set_double_member(coverage_object, "y", coverage.y);
+    json_object_set_double_member(coverage_object, "width", coverage.width);
+    json_object_set_double_member(coverage_object, "height", coverage.height);
+    json_object_set_object_member(response, "coverage", coverage_object);
+    json_object_set_int_member(response, "sourcePixelWidth", session->source_pixel_width);
+    json_object_set_int_member(response, "sourcePixelHeight", session->source_pixel_height);
     json_object_set_string_member(response, "stateDigest", session->state_digest);
     json_object_set_string_member(response, "moduleStackDigest", session->state_digest);
     json_object_set_string_member(response, "pixelpipeResultDigest",
@@ -348,11 +549,23 @@ static gboolean _handle(FILE *output, dt_remote_session_t *session, const dt_rem
     json_object_set_double_member(timing, "normalize", render_timing.normalize_ms);
     json_object_set_double_member(timing, "digest", render_timing.digest_ms);
     json_object_set_double_member(timing, "analysis", render_timing.analysis_ms);
+    json_object_set_double_member(timing, "roiFallbackFullFrame",
+                                  role == DT_REMOTE_SURFACE_VIEWPORT ? 1.0 : 0.0);
     json_object_set_double_member(timing, "surfaceCopy",
                                   render_timing.snapshot_ms + render_timing.normalize_ms +
                                       render_timing.digest_ms + render_timing.analysis_ms);
     json_object_set_double_member(timing, "histogram", session->analysis.elapsed_ms);
     json_object_set_object_member(response, "timingMs", timing);
+    fprintf(stderr,
+            "{\"component\":\"worker\",\"event\":\"renderComplete\",\"revision\":%"
+            G_GUINT64_FORMAT ",\"generation\":%" G_GUINT64_FORMAT
+            ",\"role\":\"%s\",\"durationMs\":%.6f,\"pixelpipeMs\":%.6f,"
+            "\"snapshotMs\":%.6f,\"normalizeMs\":%.6f,\"digestMs\":%.6f,"
+            "\"analysisMs\":%.6f}\n",
+            revision, generation, role_name,
+            (double)(g_get_monotonic_time() - render_start) / 1000.0,
+            render_timing.pixelpipe_ms, render_timing.snapshot_ms, render_timing.normalize_ms,
+            render_timing.digest_ms, render_timing.analysis_ms);
     JsonNode *node = _envelope(request, "surface.rendered", response);
     const gint64 write_start = g_get_monotonic_time();
     const gboolean sent =
@@ -438,31 +651,43 @@ int main(int argc, char **argv)
 
   dt_remote_session_t session;
   dt_remote_session_init(&session);
+  GAsyncQueue *input_queue = g_async_queue_new();
+  dt_remote_reader_t reader = { input_queue, &session, FALSE };
+  GThread *reader_thread = g_thread_new("remote-input", _read_worker_input, &reader);
   gboolean shutdown = FALSE;
   int result = 0;
   while(!shutdown)
   {
-    dt_remote_frame_t frame;
-    GError *error = NULL;
-    const dt_remote_read_result_t read = dt_remote_frame_read(stdin, &frame, &error);
-    if(read == DT_REMOTE_READ_EOF)
+    dt_remote_input_t *input = g_async_queue_pop(input_queue);
+    if(input->result == DT_REMOTE_READ_EOF)
+    {
+      g_free(input);
       break;
-    if(read == DT_REMOTE_READ_ERROR)
+    }
+    if(input->result == DT_REMOTE_READ_ERROR)
     {
       fprintf(stderr, "darktable-remote-worker: protocol read failed: %s\n",
-              error ? error->message : "unknown error");
-      g_clear_error(&error);
+              input->error ? input->error->message : "unknown error");
+      g_clear_error(&input->error);
+      g_free(input);
       result = 2;
       break;
     }
-    if(!_handle(protocol_output, &session, &frame, &shutdown))
+    if(!_handle(protocol_output, &session, &input->frame, &shutdown))
     {
-      dt_remote_frame_clear(&frame);
+      dt_remote_frame_clear(&input->frame);
+      g_clear_error(&input->error);
+      g_free(input);
       result = 2;
       break;
     }
-    dt_remote_frame_clear(&frame);
+    dt_remote_frame_clear(&input->frame);
+    g_clear_error(&input->error);
+    g_free(input);
   }
+  g_atomic_int_set(&reader.stop, TRUE);
+  g_thread_join(reader_thread);
+  g_async_queue_unref(input_queue);
   dt_remote_session_cleanup(&session);
   dt_cleanup();
   fflush(protocol_output);

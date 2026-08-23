@@ -138,6 +138,10 @@ typedef enum dt_dev_pixelpipe_status_t
     As we missed processing the correct output and all following modules
     will give different results accordingly we clear cachelines for following
     modules (possibly writing back input cl_mem to host for a faster restart).
+
+    DT_DEV_PIXELPIPE_STOP_CANCEL
+    A caller no longer needs this result. Stop without restarting the same
+    image job; a later request will explicitly start the replacement run.
 */
 
 typedef enum dt_dev_pixelpipe_stopper_t
@@ -149,6 +153,7 @@ typedef enum dt_dev_pixelpipe_stopper_t
   DT_DEV_PIXELPIPE_STOP_ZOOM,
   DT_DEV_PIXELPIPE_STOP_DATA,
   DT_DEV_PIXELPIPE_STOP_PIECE,
+  DT_DEV_PIXELPIPE_STOP_CANCEL,
 } dt_dev_pixelpipe_stopper_t;
 
 typedef struct dt_dev_detail_mask_t
