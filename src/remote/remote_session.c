@@ -72,6 +72,7 @@ static void _update_state_digest(dt_remote_session_t *session)
   const uint32_t version_be = GUINT32_TO_BE((uint32_t)session->exposure.module_version);
   g_checksum_update(checksum, (const guchar *)&version_be, sizeof(version_be));
   g_checksum_update(checksum, session->exposure.accepted, session->exposure.params_size);
+  dt_remote_editor_state_checksum_update(&session->editor_state, checksum);
   g_checksum_update(checksum, (const guchar *)DT_REMOTE_COLOR_CONTRACT,
                     strlen(DT_REMOTE_COLOR_CONTRACT));
   session->state_digest = g_strdup_printf("sha256:%s", g_checksum_get_string(checksum));
@@ -125,6 +126,7 @@ void dt_remote_session_cleanup(dt_remote_session_t *session)
     session->dev.preview_pipe->analysis_user_data = NULL;
     session->dev.preview2.pipe->analysis_callback = NULL;
     session->dev.preview2.pipe->analysis_user_data = NULL;
+    dt_remote_editor_state_facade_cleanup(&session->editor_state);
     dt_remote_exposure_cleanup(&session->exposure);
     dt_dev_cleanup(&session->dev);
     if(dt_is_valid_imgid(session->image_id))
@@ -221,6 +223,12 @@ gboolean dt_remote_session_open(dt_remote_session_t *session, const char *image_
   dt_dev_load_image(&session->dev, session->image_id);
   if(!dt_remote_exposure_init(&session->exposure, &session->dev, error))
     goto failed_dev;
+  if(!dt_remote_editor_state_facade_init(&session->editor_state, &session->dev,
+                                         &session->exposure, error))
+  {
+    dt_remote_exposure_cleanup(&session->exposure);
+    goto failed_dev;
+  }
   session->dev.full.pipe->analysis_callback = dt_remote_analysis_callback;
   session->dev.full.pipe->analysis_user_data = &session->analysis;
   session->dev.preview_pipe->analysis_callback = dt_remote_analysis_callback;
@@ -245,6 +253,7 @@ gboolean dt_remote_session_open(dt_remote_session_t *session, const char *image_
                        &warm_surface, &warm_timing, error))
   {
     session->open = FALSE;
+    dt_remote_editor_state_facade_cleanup(&session->editor_state);
     dt_remote_exposure_cleanup(&session->exposure);
     goto failed_dev;
   }
@@ -260,6 +269,7 @@ gboolean dt_remote_session_open(dt_remote_session_t *session, const char *image_
     _set_error(error, "could not determine developed source dimensions");
     dt_remote_surface_clear(&warm_surface);
     session->open = FALSE;
+    dt_remote_editor_state_facade_cleanup(&session->editor_state);
     dt_remote_exposure_cleanup(&session->exposure);
     goto failed_dev;
   }
@@ -315,6 +325,7 @@ gboolean dt_remote_session_set_exposure(dt_remote_session_t *session, double exp
           dt_remote_exposure_apply(&session->exposure, &session->dev, exposure_ev, black, changed,
                                    accepted_exposure, accepted_black, error))
   {
+    dt_remote_editor_state_sync_exposure(&session->editor_state, &session->exposure);
     session->revision++;
     session->desired_generation = generation;
     _update_state_digest(session);
@@ -338,10 +349,68 @@ gboolean dt_remote_session_reset_exposure(dt_remote_session_t *session, uint64_t
           dt_remote_exposure_reset(&session->exposure, &session->dev, accepted_exposure,
                                    accepted_black, error))
   {
+    dt_remote_editor_state_sync_exposure(&session->editor_state, &session->exposure);
     session->revision++;
     session->desired_generation = generation;
     _update_state_digest(session);
     ok = TRUE;
+  }
+  g_mutex_unlock(&session->mutex);
+  return ok;
+}
+
+static gboolean _refresh_source_dimensions(dt_remote_session_t *session, char **error)
+{
+  dt_dev_pixelpipe_t *pipe = session->dev.full.pipe;
+  dt_dev_pixelpipe_change(pipe, &session->dev);
+  const float input_scale = pipe->iscale > 0.0f ? pipe->iscale : 1.0f;
+  const uint32_t width = (uint32_t)llround((double)pipe->processed_width / input_scale);
+  const uint32_t height = (uint32_t)llround((double)pipe->processed_height / input_scale);
+  if(!width || !height)
+  {
+    _set_error(error, "could not determine developed dimensions after editor-state change");
+    return FALSE;
+  }
+  session->source_pixel_width = width;
+  session->source_pixel_height = height;
+  return TRUE;
+}
+
+gboolean dt_remote_session_set_state(dt_remote_session_t *session,
+                                     const dt_remote_editor_state_t *state,
+                                     uint64_t generation, char **error)
+{
+  if(error)
+    *error = NULL;
+  g_mutex_lock(&session->mutex);
+  gboolean ok = FALSE;
+  if(!session->open)
+    _set_error(error, "session is not open");
+  else if(_validate_generation(session, generation, error))
+  {
+    const dt_remote_editor_state_t previous = session->editor_state.current;
+    const uint32_t previous_width = session->source_pixel_width;
+    const uint32_t previous_height = session->source_pixel_height;
+    if(dt_remote_editor_state_apply(&session->editor_state, &session->exposure, &session->dev,
+                                    state, error))
+    {
+      if(_refresh_source_dimensions(session, error))
+      {
+        session->revision++;
+        session->desired_generation = generation;
+        _update_state_digest(session);
+        ok = TRUE;
+      }
+      else
+      {
+        char *rollback_error = NULL;
+        dt_remote_editor_state_apply(&session->editor_state, &session->exposure, &session->dev,
+                                     &previous, &rollback_error);
+        g_free(rollback_error);
+        session->source_pixel_width = previous_width;
+        session->source_pixel_height = previous_height;
+      }
+    }
   }
   g_mutex_unlock(&session->mutex);
   return ok;

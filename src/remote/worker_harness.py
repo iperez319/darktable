@@ -36,11 +36,13 @@ SHUTDOWN = 7
 CHECKPOINT_XMP = 8
 EXPORT_JPEG = 9
 CANCEL = 10
+SET_STATE = 11
 CAPABILITIES = 0x8001
 OPENED = 0x8002
 EXPOSURE_ACCEPTED = 0x8003
 RENDERED = 0x8004
 ARTIFACT_WRITTEN = 0x8005
+STATE_ACCEPTED = 0x8006
 ERROR = 0xFFFF
 
 
@@ -104,6 +106,318 @@ def envelope(message_type: str, request_id: str, session_id: str, body: dict) ->
         "sessionId": session_id,
         "body": body,
     }
+
+
+def canonical_state_fixture() -> dict:
+    """A deterministic non-default state covering every facade-v3 mapping."""
+    return {
+        "exposure": {"exposureEV": 0.75, "blackLevel": -0.02},
+        "geometry": {
+            "crop": {"x": 0.1, "y": 0.1, "width": 0.8, "height": 0.8},
+            "rotationQuarterTurns": 1,
+            "straightenDegrees": 1.5,
+            "flipHorizontal": True,
+            "flipVertical": False,
+        },
+        "whiteBalance": {"temperatureKelvin": 5200.0, "tint": 15.0},
+        "light": {
+            "contrast": 12.0,
+            "highlights": -18.0,
+            "shadows": 22.0,
+            "whites": 9.0,
+            "blacks": -11.0,
+        },
+        "color": {"vibrance": 17.0, "saturation": -8.0},
+        "toneCurve": {
+            "points": [
+                {"x": 0.0, "y": 0.0},
+                {"x": 0.25, "y": 0.2},
+                {"x": 0.7, "y": 0.78},
+                {"x": 1.0, "y": 1.0},
+            ]
+        },
+        "optics": {
+            "lensCorrection": "manual",
+            "lensProfile": "Nikkor 24-70mm f/2.8",
+            "lensProfileStatus": "applied",
+            "chromaticAberrationCorrection": True,
+            "defringe": 32.0,
+        },
+        "detail": {
+            "sharpening": 48.0,
+            "noiseReduction": 50.0,
+            "denoisePreset": "medium",
+            "highlightReconstruction": "guidedLaplacians",
+        },
+        "masks": [
+            {
+                "id": "mask-subject",
+                "name": "Subject refinement",
+                "enabled": True,
+                "inverted": False,
+                "opacity": 0.82,
+                "components": [
+                    {
+                        "id": "gradient-add",
+                        "enabled": True,
+                        "inverted": False,
+                        "operation": "add",
+                        "kind": "linearGradient",
+                        "gradient": {
+                            "start": {"x": 0.5, "y": 0.12},
+                            "end": {"x": 0.5, "y": 0.55},
+                            "feather": 0.28,
+                        },
+                        "ellipse": None,
+                        "brush": None,
+                    },
+                    {
+                        "id": "ellipse-subtract",
+                        "enabled": True,
+                        "inverted": True,
+                        "operation": "subtract",
+                        "kind": "ellipse",
+                        "gradient": None,
+                        "ellipse": {
+                            "center": {"x": 0.52, "y": 0.48},
+                            "radiusX": 0.21,
+                            "radiusY": 0.31,
+                            "rotationDegrees": 12.0,
+                            "feather": 0.18,
+                        },
+                        "brush": None,
+                    },
+                    {
+                        "id": "brush-intersect",
+                        "enabled": True,
+                        "inverted": False,
+                        "operation": "intersect",
+                        "kind": "brush",
+                        "gradient": None,
+                        "ellipse": None,
+                        "brush": {
+                            "strokes": [
+                                {
+                                    "id": "stroke-1",
+                                    "points": [
+                                        {
+                                            "x": 0.35,
+                                            "y": 0.42,
+                                            "radius": 0.035,
+                                            "hardness": 0.7,
+                                            "opacity": 0.9,
+                                            "pressure": 0.45,
+                                            "elapsedMilliseconds": 0,
+                                        },
+                                        {
+                                            "x": 0.44,
+                                            "y": 0.5,
+                                            "radius": 0.052,
+                                            "hardness": 0.7,
+                                            "opacity": 0.9,
+                                            "pressure": 0.78,
+                                            "elapsedMilliseconds": 24,
+                                        },
+                                    ],
+                                }
+                            ]
+                        },
+                    },
+                ],
+                "range": {
+                    "enabled": True,
+                    "channel": "luminance",
+                    "handles": [0.08, 0.22, 0.74, 0.91],
+                    "inverted": False,
+                },
+                "adjustments": {
+                    "exposureEV": 0.45,
+                    "contrast": 12.0,
+                    "highlights": -15.0,
+                    "shadows": 10.0,
+                    "whites": 4.0,
+                    "blacks": -6.0,
+                    "vibrance": 14.0,
+                    "saturation": 3.0,
+                },
+            }
+        ],
+    }
+
+
+def validate_canonical_state(actual: dict, expected: dict) -> None:
+    if actual.get("masks") != expected.get("masks"):
+        raise RuntimeError("accepted canonical mask geometry changed")
+    exact_paths = (
+        ("geometry", "rotationQuarterTurns"),
+        ("geometry", "flipHorizontal"),
+        ("geometry", "flipVertical"),
+        ("optics", "lensCorrection"),
+        ("optics", "lensProfile"),
+        ("optics", "lensProfileStatus"),
+        ("optics", "chromaticAberrationCorrection"),
+        ("detail", "denoisePreset"),
+        ("detail", "highlightReconstruction"),
+    )
+    for group, name in exact_paths:
+        if actual.get(group, {}).get(name) != expected[group][name]:
+            raise RuntimeError(f"accepted canonical state changed {group}.{name}")
+    numeric_paths = (
+        ("exposure", "exposureEV", 1e-5),
+        ("exposure", "blackLevel", 1e-5),
+        ("geometry", "straightenDegrees", 1e-5),
+        ("whiteBalance", "temperatureKelvin", 2.0),
+        ("whiteBalance", "tint", 0.1),
+        ("light", "contrast", 1e-4),
+        ("light", "highlights", 1e-4),
+        ("light", "shadows", 1e-4),
+        ("light", "whites", 1e-4),
+        ("light", "blacks", 1e-4),
+        ("color", "vibrance", 1e-4),
+        ("color", "saturation", 1e-4),
+        ("optics", "defringe", 1e-4),
+        ("detail", "sharpening", 1e-4),
+        ("detail", "noiseReduction", 1e-4),
+    )
+    for group, name, tolerance in numeric_paths:
+        if abs(float(actual[group][name]) - float(expected[group][name])) > tolerance:
+            raise RuntimeError(
+                f"accepted canonical state changed {group}.{name}: "
+                f"expected {expected[group][name]}, received {actual[group][name]}"
+            )
+    for name in ("x", "y", "width", "height"):
+        if abs(float(actual["geometry"]["crop"][name]) - expected["geometry"]["crop"][name]) > 1e-5:
+            raise RuntimeError(f"accepted canonical state changed geometry.crop.{name}")
+    actual_points = actual.get("toneCurve", {}).get("points")
+    expected_points = expected["toneCurve"]["points"]
+    if not isinstance(actual_points, list) or len(actual_points) != len(expected_points):
+        raise RuntimeError("accepted canonical state changed tone-curve point count")
+    for actual_point, expected_point in zip(actual_points, expected_points):
+        for axis in ("x", "y"):
+            if abs(float(actual_point[axis]) - expected_point[axis]) > 1e-5:
+                raise RuntimeError(f"accepted canonical state changed toneCurve.{axis}")
+
+
+def replay_canonical_state(
+    worker: Path,
+    image: Path,
+    root: Path,
+    state: dict,
+    max_long_edge: int,
+    width: int,
+    height: int,
+) -> tuple[str, str, tuple[int, int]]:
+    """Apply and render a complete state in a fresh process for replay parity."""
+    command = [
+        str(worker),
+        "--core",
+        "--configdir",
+        str(root / "replay-config"),
+        "--cachedir",
+        str(root / "replay-cache"),
+    ]
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    assert process.stdin is not None and process.stdout is not None
+    session_id = str(uuid.uuid4())
+    try:
+        write_frame(
+            process.stdin,
+            HELLO,
+            envelope(
+                "worker.hello",
+                str(uuid.uuid4()),
+                session_id,
+                {"gatewayBuild": "editor-state-replay/1", "protocolMajor": MAJOR},
+            ),
+        )
+        read_frame(process.stdout, CAPABILITIES)
+        write_frame(
+            process.stdin,
+            OPEN,
+            envelope(
+                "session.open",
+                str(uuid.uuid4()),
+                session_id,
+                {
+                    "imagePath": str(image),
+                    "maxLongEdge": max_long_edge,
+                    "histogramBins": 1024,
+                    "colorContract": "srgb-sdr-surface-v1",
+                },
+            ),
+        )
+        read_frame(process.stdout, OPENED)
+        write_frame(
+            process.stdin,
+            SET_STATE,
+            envelope(
+                "session.setState",
+                str(uuid.uuid4()),
+                session_id,
+                {"generation": 1, "state": state},
+            ),
+        )
+        accepted, attachment = read_frame(process.stdout, STATE_ACCEPTED)
+        if attachment:
+            raise RuntimeError("replayed state acceptance carried an attachment")
+        revision = int(accepted["body"]["revision"])
+        write_frame(
+            process.stdin,
+            RENDER,
+            envelope(
+                "surface.render",
+                str(uuid.uuid4()),
+                session_id,
+                {
+                    "generation": 2,
+                    "revision": revision,
+                    "role": "overview",
+                    "normalizedRect": {
+                        "x": 0.0,
+                        "y": 0.0,
+                        "width": 1.0,
+                        "height": 1.0,
+                    },
+                    "sourcePixelsPerOutputPixel": 1.0,
+                    "overscanPixels": 0,
+                    "width": width,
+                    "height": height,
+                },
+            ),
+        )
+        rendered, pixels = read_frame(process.stdout, RENDERED)
+        validate_surface(rendered, pixels, 2, revision, False)
+        return (
+            accepted["body"]["stateDigest"],
+            rendered["body"]["pixelDigest"],
+            (
+                int(accepted["body"]["sourcePixelWidth"]),
+                int(accepted["body"]["sourcePixelHeight"]),
+            ),
+        )
+    finally:
+        if process.poll() is None:
+            try:
+                write_frame(
+                    process.stdin,
+                    SHUTDOWN,
+                    envelope(
+                        "worker.shutdown",
+                        str(uuid.uuid4()),
+                        session_id,
+                        {"reason": "replay-complete"},
+                    ),
+                )
+                process.stdin.close()
+                process.wait(timeout=30)
+            except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
+                process.kill()
+                process.wait()
 
 
 def process_rss_mib(pid: int) -> float | None:
@@ -355,6 +669,31 @@ def run(args: argparse.Namespace) -> int:
                 "display-referred-float-pre-pack-v1"
             ]:
                 raise RuntimeError("worker does not advertise the WP3 histogram domain")
+            editor_capabilities = capabilities["body"].get("editorState", {})
+            expected_modules = {
+                "crop": ("crop", 3),
+                "orientation": ("flip", 2),
+                "straighten": ("ashift", 5),
+                "whiteBalance": ("temperature", 4),
+                "contrastVibranceSaturation": ("colorbalancergb", 5),
+                "tonalRanges": ("toneequal", 2),
+                "toneCurve": ("rgbcurve", 1),
+                "lensCorrection": ("lens", 10),
+                "chromaticAberration": ("cacorrect", 2),
+                "defringe": ("defringe", 1),
+                "sharpening": ("sharpen", 1),
+                "noiseReduction": ("denoiseprofile", 12),
+                "highlightReconstruction": ("highlights", 4),
+                "maskLocalAdjustments": ("colorbalancergb", 5),
+            }
+            if editor_capabilities.get("schemaVersion") != 3:
+                raise RuntimeError("worker does not advertise canonical editor-state schema 3")
+            if capabilities["body"].get("facadeMappings", {}).get("version") != 3:
+                raise RuntimeError("worker does not advertise photographic facade mapping 3")
+            for role, (operation, version) in expected_modules.items():
+                module = editor_capabilities.get("modules", {}).get(role, {})
+                if module.get("operation") != operation or module.get("version") != version:
+                    raise RuntimeError(f"worker advertises the wrong {role} module mapping")
             if (
                 args.expected_commit
                 and capabilities["body"].get("darktableCommit") != args.expected_commit
@@ -384,6 +723,9 @@ def run(args: argparse.Namespace) -> int:
             baseline_black = float(opened["body"]["baselineValues"]["black"])
             baseline_exposure = float(opened["body"]["baselineValues"]["exposureEV"])
             baseline_digest = opened["body"]["stateDigest"]
+            baseline_state = opened["body"].get("baselineState")
+            if not isinstance(baseline_state, dict) or opened["body"].get("currentState") != baseline_state:
+                raise RuntimeError("session.opened is missing matching baseline/current canonical states")
             source_dimensions = (
                 int(opened["body"]["sourcePixelWidth"]),
                 int(opened["body"]["sourcePixelHeight"]),
@@ -851,6 +1193,145 @@ def run(args: argparse.Namespace) -> int:
                         f"best local crop offset {best_offset} has mean delta {best_mean:.3f}"
                     )
 
+            # Validate the whole-state facade after the legacy exposure and ROI
+            # contracts. First reject a malformed curve without advancing the
+            # revision, then apply the same complete state twice and require
+            # byte-stable engine/canonical digests.
+            state_fixture = canonical_state_fixture()
+            invalid_state = json.loads(json.dumps(state_fixture))
+            invalid_state["toneCurve"]["points"][1]["x"] = 0.9
+            state_generation = parity_generation + 3
+            request_id = str(uuid.uuid4())
+            write_frame(
+                process.stdin,
+                SET_STATE,
+                envelope(
+                    "session.setState",
+                    request_id,
+                    session_id,
+                    {"generation": state_generation, "state": invalid_state},
+                ),
+            )
+            read_error(process.stdout, "invalid_state")
+
+            invalid_mask_state = json.loads(json.dumps(state_fixture))
+            invalid_gradient = invalid_mask_state["masks"][0]["components"][0]["gradient"]
+            invalid_gradient["end"] = invalid_gradient["start"]
+            write_frame(
+                process.stdin,
+                SET_STATE,
+                envelope(
+                    "session.setState",
+                    str(uuid.uuid4()),
+                    session_id,
+                    {"generation": state_generation, "state": invalid_mask_state},
+                ),
+            )
+            read_error(process.stdout, "invalid_state")
+
+            next_state_generation = state_generation + 1
+            for temperature, tint in ((1901.0, -100.0), (25000.0, 100.0)):
+                boundary_state = json.loads(json.dumps(state_fixture))
+                boundary_state["whiteBalance"]["temperatureKelvin"] = temperature
+                boundary_state["whiteBalance"]["tint"] = tint
+                write_frame(
+                    process.stdin,
+                    SET_STATE,
+                    envelope(
+                        "session.setState",
+                        str(uuid.uuid4()),
+                        session_id,
+                        {"generation": next_state_generation, "state": boundary_state},
+                    ),
+                )
+                boundary_accepted, attachment = read_frame(process.stdout, STATE_ACCEPTED)
+                if attachment:
+                    raise RuntimeError("boundary state acceptance carried an attachment")
+                validate_canonical_state(boundary_accepted["body"]["state"], boundary_state)
+                next_state_generation += 1
+
+            state_acceptances: list[dict] = []
+            for repeat in range(2):
+                generation = next_state_generation
+                next_state_generation += 1
+                request_id = str(uuid.uuid4())
+                write_frame(
+                    process.stdin,
+                    SET_STATE,
+                    envelope(
+                        "session.setState",
+                        request_id,
+                        session_id,
+                        {"generation": generation, "state": state_fixture},
+                    ),
+                )
+                accepted_state, attachment = read_frame(process.stdout, STATE_ACCEPTED)
+                if attachment:
+                    raise RuntimeError("state acceptance unexpectedly carried an attachment")
+                validate_canonical_state(accepted_state["body"]["state"], state_fixture)
+                state_acceptances.append(accepted_state)
+            first_state_body = state_acceptances[0]["body"]
+            second_state_body = state_acceptances[1]["body"]
+            if (
+                first_state_body["stateDigest"] != second_state_body["stateDigest"]
+                or first_state_body["state"] != second_state_body["state"]
+            ):
+                raise RuntimeError("identical canonical states did not normalize deterministically")
+            if int(second_state_body["revision"]) != int(first_state_body["revision"]) + 1:
+                raise RuntimeError("canonical state revisions are not strictly sequential")
+            revision = int(second_state_body["revision"])
+            source_dimensions = (
+                int(second_state_body["sourcePixelWidth"]),
+                int(second_state_body["sourcePixelHeight"]),
+            )
+            if source_dimensions[0] <= 0 or source_dimensions[1] <= 0:
+                raise RuntimeError("state acceptance is missing developed source dimensions")
+
+            state_render_digests: list[tuple[str, str]] = []
+            for repeat in range(2):
+                generation = next_state_generation
+                next_state_generation += 1
+                request_id = str(uuid.uuid4())
+                write_frame(
+                    process.stdin,
+                    RENDER,
+                    envelope(
+                        "surface.render",
+                        request_id,
+                        session_id,
+                        {
+                            "generation": generation,
+                            "revision": revision,
+                            "role": "overview",
+                            "normalizedRect": {
+                                "x": 0.0,
+                                "y": 0.0,
+                                "width": 1.0,
+                                "height": 1.0,
+                            },
+                            "sourcePixelsPerOutputPixel": 1.0,
+                            "overscanPixels": 0,
+                            "width": args.width,
+                            "height": args.height,
+                        },
+                    ),
+                )
+                rendered_state, pixels = read_frame(process.stdout, RENDERED)
+                histogram_digest = validate_surface(
+                    rendered_state,
+                    pixels,
+                    generation,
+                    revision,
+                    args.require_histogram_edge_bins,
+                )
+                state_render_digests.append(
+                    (rendered_state["body"]["pixelDigest"], histogram_digest)
+                )
+            if state_render_digests[0] != state_render_digests[1]:
+                raise RuntimeError("canonical state render/histogram output is not deterministic")
+            canonical_state_digest = second_state_body["stateDigest"]
+            canonical_pixel_digest = state_render_digests[0][0]
+
             xmp_path = root / "checkpoint.xmp"
             request_id = str(uuid.uuid4())
             write_frame(
@@ -869,6 +1350,27 @@ def run(args: argparse.Namespace) -> int:
             xmp = validate_artifact(checkpoint, xmp_path, "xmp")
             if b"darktable:" not in xmp:
                 raise RuntimeError("checkpoint does not contain darktable XMP state")
+            if b"darktable:masks_history" not in xmp or b"Subject refinement" not in xmp:
+                raise RuntimeError("checkpoint does not contain canonical mask forms and names")
+            for operation in (
+                b"crop",
+                b"flip",
+                b"ashift",
+                b"temperature",
+                b"colorbalancergb",
+                b"toneequal",
+                b"rgbcurve",
+                b"lens",
+                b"cacorrect",
+                b"defringe",
+                b"sharpen",
+                b"denoiseprofile",
+                b"highlights",
+            ):
+                if operation not in xmp:
+                    raise RuntimeError(
+                        f"checkpoint does not contain canonical {operation.decode()} state"
+                    )
 
             jpeg_path = root / "full-resolution.jpg"
             request_id = str(uuid.uuid4())
@@ -903,6 +1405,27 @@ def run(args: argparse.Namespace) -> int:
             return_code = process.wait(timeout=30)
             if return_code:
                 raise RuntimeError(f"worker exited with status {return_code}")
+            replay_digest, replay_pixel_digest, replay_dimensions = replay_canonical_state(
+                worker,
+                image,
+                root,
+                state_fixture,
+                args.max_long_edge,
+                args.width,
+                args.height,
+            )
+            if (
+                replay_digest != canonical_state_digest
+                or replay_pixel_digest != canonical_pixel_digest
+                or replay_dimensions != source_dimensions
+            ):
+                raise RuntimeError(
+                    "fresh-worker canonical replay did not reproduce state, pixels, and geometry: "
+                    f"state={replay_digest == canonical_state_digest}, "
+                    f"pixels={replay_pixel_digest == canonical_pixel_digest}, "
+                    f"dimensions={replay_dimensions == source_dimensions}; "
+                    f"pixelDigest={canonical_pixel_digest}, replayPixelDigest={replay_pixel_digest}"
+                )
             peak_raw = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
             peak_rss = peak_raw / (1024.0 * 1024.0) if sys.platform == "darwin" else peak_raw / 1024.0
             limit_failures = []

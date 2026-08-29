@@ -11,6 +11,7 @@
 #pragma once
 
 #include "remote/remote_analysis.h"
+#include "remote/remote_editor_state.h"
 #include "remote/remote_exposure.h"
 #include "remote/remote_surface.h"
 
@@ -18,7 +19,8 @@ typedef enum dt_remote_surface_role_t
 {
   DT_REMOTE_SURFACE_OVERVIEW,
   DT_REMOTE_SURFACE_VIEWPORT,
-  DT_REMOTE_SURFACE_BASELINE
+  DT_REMOTE_SURFACE_BASELINE,
+  DT_REMOTE_SURFACE_GEOMETRY_PREVIEW
 } dt_remote_surface_role_t;
 
 typedef struct dt_remote_normalized_rect_t
@@ -32,6 +34,7 @@ typedef struct dt_remote_session_t
   dt_develop_t dev;
   dt_dev_viewport_t overview;
   dt_remote_exposure_t exposure;
+  dt_remote_editor_state_facade_t editor_state;
   dt_remote_analysis_t analysis;
   GMutex mutex;
   GMutex viewport_cancel_mutex;
@@ -64,6 +67,9 @@ gboolean dt_remote_session_set_exposure(dt_remote_session_t *session, double exp
 gboolean dt_remote_session_reset_exposure(dt_remote_session_t *session, uint64_t generation,
                                           float *accepted_exposure, float *accepted_black,
                                           char **error);
+gboolean dt_remote_session_set_state(dt_remote_session_t *session,
+                                     const dt_remote_editor_state_t *state,
+                                     uint64_t generation, char **error);
 gboolean dt_remote_session_render(dt_remote_session_t *session, uint64_t revision,
                                   uint64_t generation, uint32_t width, uint32_t height,
                                   dt_remote_surface_role_t role,

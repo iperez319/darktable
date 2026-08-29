@@ -37,6 +37,8 @@ gboolean dt_remote_exposure_apply(dt_remote_exposure_t *exposure, dt_develop_t *
                                   double exposure_ev, double black,
                                   dt_remote_changed_field_t changed, float *accepted_exposure,
                                   float *accepted_black, char **error);
+gboolean dt_remote_exposure_apply_exact(dt_remote_exposure_t *exposure, dt_develop_t *dev,
+                                        double exposure_ev, double black, char **error);
 gboolean dt_remote_exposure_reset(dt_remote_exposure_t *exposure, dt_develop_t *dev,
                                   float *accepted_exposure, float *accepted_black, char **error);
 void dt_remote_exposure_values(const dt_remote_exposure_t *exposure, const uint8_t *params,

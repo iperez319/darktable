@@ -14,6 +14,9 @@ WP2 and WP3 provide:
 - introspection-checked Exposure v7 state, full-blob baseline/reset semantics,
   intent-aware Exposure/Black coupling, and deterministic state digests;
 - serialized revision/generation mutation and rendering;
+- a `geometry-preview` surface role used for a whole-image, uncropped crop
+  draft proxy; the gateway owns temporary neutral-geometry application and
+  exact canonical restoration around that render;
 - a generation-scoped, one-way cancellation path that atomically stops a
   superseded viewport pixelpipe while leaving its replacement and session state
   intact;
@@ -30,6 +33,80 @@ WP2 and WP3 provide:
 `display-referred-float-pre-pack-v1` domain. Its RGB arrays each contain 1,024
 bins and sum to `sampledPixels`. The histogram and raw surface share the outer
 revision/generation and the same `pixelpipeResultDigest`; framing is unchanged.
+
+## Canonical editor state
+
+Private message `session.setState` (`11`) accepts one authoritative state and
+returns `session.stateAccepted` (`0x8006`). `session.opened` and
+`session.describe` include `baselineState` and `currentState` in addition to the
+legacy Exposure `baselineValues`/`currentValues`. Legacy Exposure messages 3
+and 4 remain supported and update the Exposure portion of `currentState`.
+
+The worker advertises the schema, ranges, exact operation/version pins, and
+mapping names in `worker.capabilities.editorState`. The mappings are:
+
+- Exposure v7: `exposureEV` and `blackLevel` are written directly. Unlike the
+  legacy single-field message, whole-state application does not run the
+  Exposure/Black gesture-coupling rule.
+- Crop v3: oriented-normalized `{x,y,width,height}` becomes
+  `{cx=x, cy=y, cw=x+width, ch=y+height}` with free aspect. Width and height
+  have the module's 0.01 minimum.
+- Orientation (`flip`) v2: `rotationQuarterTurns` is clockwise; horizontal and
+  vertical flips are then composed in output axes. The product transform is
+  composed over the image's baseline/EXIF orientation, so the zero state does
+  not discard camera orientation.
+- Rotate and perspective (`ashift`) v5: `straightenDegrees` maps directly to
+  `rotation`, with largest-area automatic crop. No perspective correction is
+  exposed by this schema.
+- Temperature v4: Kelvin is converted to CIE xy with the standard analytic
+  blackbody formula below 4000 K and daylight formula at/above 4000 K, then to
+  image-specific camera coefficients normalized to green = 1. If an extreme
+  Kelvin/tint combination would exceed temperature v4's coefficient maximum,
+  all four coefficients are uniformly scaled to a maximum of 8, preserving
+  chromaticity at the cost of a global white-balance gain shift. Product tint
+  maps piecewise around neutral: for `t >= 0`, engine tint is
+  `1 + t/100 * (2.326 - 1)`; otherwise it is
+  `1 + t/100 * (1 - 0.135)`. Temperature v4 stores coefficients rather than
+  Kelvin/tint, so accepted canonical Kelvin/tint are the normalized source of
+  truth; baseline coefficient inversion is approximate and falls back to
+  6500 K/zero tint when the source matrix is not invertible.
+- Color balance RGB v5: Contrast, Vibrance, and Saturation divide by 100 and
+  map to `contrast`, `vibrance`, and `saturation_global`.
+- Tone equalizer v2: each signed percentage divides by 50. Blacks drive the
+  noise and two deepest bands, Shadows drive the next three bands, Highlights
+  drive the highlight band, and Whites drive white/specular bands; midtones are
+  held at zero.
+- RGB curve v1: 2...20 strictly x-sorted points are installed as the linked
+  master curve using monotone Hermite interpolation. Independent channel curves
+  are intentionally outside this MVP3 contract.
+- Lens correction v10: `off`, `automatic`, and `manual` map to the Lensfun
+  method with all distortion/TCA/vignette corrections. Automatic retains the
+  image-derived baseline profile; manual installs the bounded submitted profile
+  name. An empty resolved profile returns `missing` and leaves the module off.
+- Raw chromatic aberrations v2 is an independent enable switch. Defringe v1
+  maps 0...100 to `threshold = 128 - 1.275 × amount`; zero disables it.
+- Sharpen v1 maps 0...100 to USM amount 0...2. Profiled denoise v12 uses
+  wavelets and maps 0...100 to strength 0.25...2; zero disables it and the
+  off/low/medium/high presets canonicalize to 0/25/50/75.
+- Highlight reconstruction v4 maps the five named product choices to inpaint
+  opposed, clip, reconstruct color, guided laplacians, or segmentation.
+- Conventional masks use darktable drawn-mask forms in oriented-normalized
+  coordinates. Linear gradients map to gradient forms, ellipses to ellipse
+  forms, and each brush stroke to a brush form inside a component group so
+  component-level inversion and add/subtract/intersect composition remain
+  ordered. Each canonical mask owns a duplicated Color Balance RGB v5 instance;
+  its opacity/inversion, drawn group, optional parametric channel/four-handle
+  range, and local Exposure/Light/Color controls are installed in blend and
+  module parameters. Creating an instance rebuilds the pixelpipe topology before
+  the first authoritative render.
+
+AI object masks remain outside facade v3. Parameters in the pinned modules that
+are not product controls are copied from the session baseline.
+The state digest covers the normalized canonical fields, module versions,
+enablement, and complete accepted parameter blobs. A geometry commit also
+recomputes the developed dimensions from the synchronized full pixelpipe before
+acceptance, so subsequent overview, viewport, XMP, and JPEG operations use the
+same geometry.
 
 ## Build
 
@@ -68,6 +145,20 @@ active native viewport immediately, verify its correlated `render_superseded`
 result (including the pre-pixelpipe cancellation race), and then prove the same
 worker can render the replacement. Use `--viewport-cancel-delay-ms` to exercise
 cancellation later in the pixelpipe as well.
+
+The same run now validates the complete Phase 22 state with a frozen non-default
+crop/rotation/straighten/WB/Light/Color/curve and gradient/ellipse/brush mask
+fixture. It rejects an invalid curve and invalid gradient before mutation,
+applies the fixture twice to prove normalized state and digest stability,
+renders twice to prove pixel/histogram stability, verifies every mapped module
+and mask form is checkpointed to XMP, checks geometry-aware full-resolution export, and
+replays the state in a fresh worker to require identical state, pixels, and
+dimensions. Pure mapping/boundary checks can be run without initializing
+darktable:
+
+```sh
+build/bin/darktable-remote-worker --editor-state-self-test
+```
 
 The worker now reports separate `snapshot`, `normalize`, `digest`, and
 `analysis` spans while retaining aggregate `surfaceCopy` compatibility. It

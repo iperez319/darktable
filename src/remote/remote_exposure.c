@@ -215,6 +215,40 @@ gboolean dt_remote_exposure_apply(dt_remote_exposure_t *exposure, dt_develop_t *
   return TRUE;
 }
 
+gboolean dt_remote_exposure_apply_exact(dt_remote_exposure_t *exposure, dt_develop_t *dev,
+                                        double exposure_ev, double black, char **error)
+{
+  if(error)
+    *error = NULL;
+  if(!isfinite(exposure_ev) || !isfinite(black) ||
+     exposure_ev < exposure->exposure_field->Float.Min ||
+     exposure_ev > exposure->exposure_field->Float.Max ||
+     black < exposure->black_field->Float.Min || black > exposure->black_field->Float.Max)
+  {
+    _set_error(error, "candidate exposure is outside the advertised range");
+    return FALSE;
+  }
+
+  uint8_t *candidate = _duplicate_params(exposure->accepted, exposure->params_size);
+  if(!candidate)
+  {
+    _set_error(error, "could not allocate exposure candidate");
+    return FALSE;
+  }
+  const float normalized_exposure = (float)exposure_ev;
+  const float normalized_black = (float)black;
+  memcpy(_field_pointer(exposure->mode_field, candidate), &exposure->manual_mode,
+         sizeof(exposure->manual_mode));
+  memcpy(_field_pointer(exposure->exposure_field, candidate), &normalized_exposure,
+         sizeof(normalized_exposure));
+  memcpy(_field_pointer(exposure->black_field, candidate), &normalized_black,
+         sizeof(normalized_black));
+  _install(exposure, dev, candidate);
+  memcpy(exposure->accepted, candidate, exposure->params_size);
+  g_free(candidate);
+  return TRUE;
+}
+
 gboolean dt_remote_exposure_reset(dt_remote_exposure_t *exposure, dt_develop_t *dev,
                                   float *accepted_exposure, float *accepted_black, char **error)
 {

@@ -7,6 +7,8 @@ add_executable(darktable-remote-worker
   remote_main.c
   remote_protocol.c
   remote_session.c
+  remote_editor_state.c
+  remote_masks.c
   remote_exposure.c
   remote_analysis.c
   remote_surface.c)

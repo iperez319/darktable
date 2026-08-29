@@ -222,6 +222,8 @@ const char *dt_remote_message_name(uint16_t type)
     return "session.exportJpeg";
   case DT_REMOTE_SURFACE_CANCEL:
     return "surface.cancel";
+  case DT_REMOTE_SESSION_SET_STATE:
+    return "session.setState";
   case DT_REMOTE_WORKER_CAPABILITIES:
     return "worker.capabilities";
   case DT_REMOTE_SESSION_OPENED:
@@ -232,6 +234,8 @@ const char *dt_remote_message_name(uint16_t type)
     return "surface.rendered";
   case DT_REMOTE_ARTIFACT_WRITTEN:
     return "artifact.written";
+  case DT_REMOTE_SESSION_STATE_ACCEPTED:
+    return "session.stateAccepted";
   case DT_REMOTE_WORKER_ERROR:
     return "worker.error";
   default:
