@@ -99,9 +99,11 @@ mapping names in `worker.capabilities.editorState`. The mappings are:
   convention. Each brush stroke becomes a brush form inside a component group,
   so component-level inversion and add/subtract/intersect composition remain
   ordered. Each canonical mask owns duplicated Exposure v7 and Color Balance
-  RGB v5 instances; opacity/inversion, the drawn group, optional parametric
-  channel/four-handle range, and local Exposure/Light/Color controls are
-  installed in native blend and module parameters. Creating an instance
+  RGB v5 instances; opacity/inversion, an optional drawn group and/or parametric
+  input-channel/four-handle range, and local Exposure/Light/Color controls are
+  installed in native blend and module parameters. Scene-referred luminance,
+  chroma, and hue map to darktable Jz, Cz, and hz channels; RGB channels and
+  per-range inversion remain available. Creating an instance
   rebuilds pixelpipe topology before the first authoritative render.
 
 AI object masks remain outside facade v3. Parameters in the pinned modules that

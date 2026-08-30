@@ -1124,6 +1124,7 @@ gboolean dt_remote_editor_state_run_self_tests(char **error)
 {
   if(error)
     *error = NULL;
+  if(!dt_remote_masks_run_self_tests(error)) return FALSE;
   dt_remote_editor_state_t state = {
     .geometry = {
       .width = 1.0,

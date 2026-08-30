@@ -1633,6 +1633,41 @@ def run(args: argparse.Namespace) -> int:
             )
             next_state_generation += 1
 
+            standalone_range_state = json.loads(json.dumps(spatial_baseline))
+            standalone_range_mask = local_exposure_mask({}, "standalone-parametric")
+            standalone_range_mask["components"] = []
+            standalone_range_mask["range"] = {
+                "enabled": True,
+                "channel": "luminance",
+                "handles": [0.0, 0.0, 1.0, 1.0],
+                "inverted": False,
+            }
+            standalone_range_state["masks"] = [standalone_range_mask]
+            _, standalone_range_pixels = apply_and_render_state(
+                process,
+                session_id,
+                standalone_range_state,
+                next_state_generation,
+                args.width,
+                args.height,
+            )
+            if standalone_range_pixels == spatial_baseline_pixels:
+                raise RuntimeError("standalone parametric mask produced no image adjustment")
+            next_state_generation += 1
+
+            standalone_range_mask["range"]["inverted"] = True
+            _, inverted_range_pixels = apply_and_render_state(
+                process,
+                session_id,
+                standalone_range_state,
+                next_state_generation,
+                args.width,
+                args.height,
+            )
+            if inverted_range_pixels != spatial_baseline_pixels:
+                raise RuntimeError("inverted full parametric range did not exclude the adjustment")
+            next_state_generation += 1
+
             for temperature, tint in ((1901.0, -100.0), (25000.0, 100.0)):
                 boundary_state = json.loads(json.dumps(state_fixture))
                 boundary_state["whiteBalance"]["temperatureKelvin"] = temperature

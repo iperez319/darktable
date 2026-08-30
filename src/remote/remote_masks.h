@@ -13,6 +13,7 @@
 #include "remote/remote_editor_state.h"
 
 gboolean dt_remote_masks_validate(const char *masks_json, char **error);
+gboolean dt_remote_masks_run_self_tests(char **error);
 gboolean dt_remote_masks_apply(dt_remote_editor_state_facade_t *facade,
                                dt_develop_t *dev,
                                dt_iop_module_t *exposure_module,

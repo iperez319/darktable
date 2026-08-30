@@ -455,11 +455,20 @@ static gboolean _build_forms(JsonArray *masks,
   {
     JsonObject *mask = json_array_get_object_element(masks, mask_index);
     JsonArray *components = mask ? json_object_get_array_member(mask, "components") : NULL;
+    JsonObject *range = mask ? json_object_get_object_member(mask, "range") : NULL;
+    const guint component_count = components ? json_array_get_length(components) : 0;
+    const gboolean has_parametric_range =
+      range && json_object_get_boolean_member_with_default(range, "enabled", FALSE);
     if(!_mask_configuration_is_valid(mask) || !components
-       || json_array_get_length(components) == 0
-       || json_array_get_length(components) > DT_REMOTE_MAX_MASK_COMPONENTS)
+       || component_count > DT_REMOTE_MAX_MASK_COMPONENTS
+       || (component_count == 0 && !has_parametric_range))
     {
       return FALSE;
+    }
+    if(component_count == 0)
+    {
+      g_ptr_array_add(groups, NULL);
+      continue;
     }
     dt_masks_form_t *group = dt_masks_create(DT_MASKS_GROUP);
     if(!group)
@@ -471,7 +480,7 @@ static gboolean _build_forms(JsonArray *masks,
     *forms = g_list_append(*forms, group);
     g_ptr_array_add(groups, group);
     for(guint component_index = 0;
-        ok && component_index < json_array_get_length(components); component_index++)
+        ok && component_index < component_count; component_index++)
       ok = _component_forms(json_array_get_object_element(components, component_index),
                             group, forms, transform);
     if(!group->points)
@@ -539,14 +548,21 @@ static gboolean _write_float(dt_iop_module_t *module, uint8_t *params,
   return TRUE;
 }
 
-static int _parametric_channel(const char *channel)
+static int _parametric_channel(const char *channel,
+                               dt_develop_blend_colorspace_t blend_colorspace)
 {
   if(!g_strcmp0(channel, "red")) return DEVELOP_BLENDIF_RED_in;
   if(!g_strcmp0(channel, "green")) return DEVELOP_BLENDIF_GREEN_in;
   if(!g_strcmp0(channel, "blue")) return DEVELOP_BLENDIF_BLUE_in;
+  if(blend_colorspace == DEVELOP_BLEND_CS_RGB_SCENE)
+  {
+    if(!g_strcmp0(channel, "hue")) return DEVELOP_BLENDIF_hz_in;
+    if(!g_strcmp0(channel, "saturation")) return DEVELOP_BLENDIF_Cz_in;
+    return DEVELOP_BLENDIF_Jz_in;
+  }
   if(!g_strcmp0(channel, "hue")) return DEVELOP_BLENDIF_H_in;
   if(!g_strcmp0(channel, "saturation")) return DEVELOP_BLENDIF_S_in;
-  return DEVELOP_BLENDIF_GRAY_in;
+  return DEVELOP_BLENDIF_l_in;
 }
 
 static gboolean _configure_blend(dt_iop_module_t *module, JsonObject *mask,
@@ -558,16 +574,20 @@ static gboolean _configure_blend(dt_iop_module_t *module, JsonObject *mask,
   // DEVELOP_MASK_ENABLED is the gate checked by the pixelpipe before it calls
   // the blend stage. Setting only DEVELOP_MASK_MASK leaves the module's
   // processed output unblended, which makes a supposedly local edit global.
-  blend->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
+  const gboolean has_drawn_mask = group_id != INVALID_MASKID;
+  blend->mask_mode = DEVELOP_MASK_ENABLED | (has_drawn_mask ? DEVELOP_MASK_MASK : 0);
   blend->mask_id = group_id;
   blend->blend_mode = DEVELOP_BLEND_NORMAL2;
   blend->opacity = (float)(100.0 * json_object_get_double_member(mask, "opacity"));
-  if(json_object_get_boolean_member_with_default(mask, "inverted", FALSE))
+  const gboolean mask_inverted =
+    json_object_get_boolean_member_with_default(mask, "inverted", FALSE);
+  if(has_drawn_mask && mask_inverted)
     blend->mask_combine |= DEVELOP_COMBINE_MASKS_POS;
   JsonObject *range = json_object_get_object_member(mask, "range");
   if(range && json_object_get_boolean_member_with_default(range, "enabled", FALSE))
   {
-    const int channel = _parametric_channel(json_object_get_string_member(range, "channel"));
+    const int channel = _parametric_channel(
+      json_object_get_string_member(range, "channel"), blend->blend_cst);
     JsonArray *handles = json_object_get_array_member(range, "handles");
     if(!handles || json_array_get_length(handles) != 4)
     {
@@ -579,7 +599,9 @@ static gboolean _configure_blend(dt_iop_module_t *module, JsonObject *mask,
     for(guint index = 0; index < 4; index++)
       blend->blendif_parameters[4 * channel + index] =
         (float)json_array_get_double_element(handles, index);
-    if(json_object_get_boolean_member_with_default(range, "inverted", FALSE))
+    const gboolean range_inverted =
+      json_object_get_boolean_member_with_default(range, "inverted", FALSE);
+    if(range_inverted != (!has_drawn_mask && mask_inverted))
       blend->blendif |= (1u << (channel + 16));
   }
   return TRUE;
@@ -751,10 +773,11 @@ gboolean dt_remote_masks_apply(dt_remote_editor_state_facade_t *facade,
     dt_iop_module_t *module =
       _module_for_mask(&facade->mask_modules, dev, facade->color_balance.module, index);
     dt_masks_form_t *group = g_ptr_array_index(groups, index);
+    const dt_mask_id_t group_id = group ? group->formid : INVALID_MASKID;
     JsonObject *mask = json_array_get_object_element(masks, index);
     ok = local_exposure && module
-         && _configure_exposure_module(local_exposure, mask, group->formid, error)
-         && _configure_color_module(module, mask, group->formid, error);
+         && _configure_exposure_module(local_exposure, mask, group_id, error)
+         && _configure_color_module(module, mask, group_id, error);
   }
   if(facade->mask_exposure_modules)
     for(guint index = count; index < facade->mask_exposure_modules->len; index++)
@@ -786,4 +809,55 @@ void dt_remote_masks_cleanup(dt_remote_editor_state_facade_t *facade)
   if(facade->mask_modules)
     g_ptr_array_free(facade->mask_modules, TRUE);
   facade->mask_modules = NULL;
+}
+
+gboolean dt_remote_masks_run_self_tests(char **error)
+{
+  if(_parametric_channel("luminance", DEVELOP_BLEND_CS_RGB_SCENE) != DEVELOP_BLENDIF_Jz_in
+     || _parametric_channel("saturation", DEVELOP_BLEND_CS_RGB_SCENE) != DEVELOP_BLENDIF_Cz_in
+     || _parametric_channel("hue", DEVELOP_BLEND_CS_RGB_SCENE) != DEVELOP_BLENDIF_hz_in
+     || _parametric_channel("luminance", DEVELOP_BLEND_CS_RGB_DISPLAY) != DEVELOP_BLENDIF_l_in
+     || _parametric_channel("saturation", DEVELOP_BLEND_CS_RGB_DISPLAY) != DEVELOP_BLENDIF_S_in
+     || _parametric_channel("hue", DEVELOP_BLEND_CS_RGB_DISPLAY) != DEVELOP_BLENDIF_H_in
+     || _parametric_channel("red", DEVELOP_BLEND_CS_RGB_SCENE) != DEVELOP_BLENDIF_RED_in
+     || _parametric_channel("green", DEVELOP_BLEND_CS_RGB_SCENE) != DEVELOP_BLENDIF_GREEN_in
+     || _parametric_channel("blue", DEVELOP_BLEND_CS_RGB_SCENE) != DEVELOP_BLENDIF_BLUE_in)
+  {
+    _set_error(error, "parametric mask channel mapping self-test failed");
+    return FALSE;
+  }
+  const char *standalone_range =
+    "[{\"id\":\"range-mask\",\"name\":\"Highlights\",\"enabled\":true,"
+    "\"inverted\":false,\"opacity\":1.0,\"components\":[],"
+    "\"range\":{\"enabled\":true,\"channel\":\"luminance\","
+    "\"handles\":[0.55,0.7,1.0,1.0],\"inverted\":false},"
+    "\"adjustments\":{\"exposureEV\":-0.5,\"contrast\":0,\"highlights\":0,"
+    "\"shadows\":0,\"whites\":0,\"blacks\":0,\"vibrance\":0,"
+    "\"saturation\":0}}]";
+  char *validation_error = NULL;
+  if(!dt_remote_masks_validate(standalone_range, &validation_error))
+  {
+    _set_error(error, "standalone parametric mask self-test failed: %s",
+               validation_error ? validation_error : "unknown error");
+    g_free(validation_error);
+    return FALSE;
+  }
+  g_free(validation_error);
+  const char *disabled_standalone_range =
+    "[{\"id\":\"range-mask\",\"name\":\"Highlights\",\"enabled\":true,"
+    "\"inverted\":false,\"opacity\":1.0,\"components\":[],"
+    "\"range\":{\"enabled\":false,\"channel\":\"luminance\","
+    "\"handles\":[0.55,0.7,1.0,1.0],\"inverted\":false},"
+    "\"adjustments\":{\"exposureEV\":-0.5,\"contrast\":0,\"highlights\":0,"
+    "\"shadows\":0,\"whites\":0,\"blacks\":0,\"vibrance\":0,"
+    "\"saturation\":0}}]";
+  validation_error = NULL;
+  if(dt_remote_masks_validate(disabled_standalone_range, &validation_error))
+  {
+    _set_error(error, "disabled standalone parametric mask unexpectedly validated");
+    g_free(validation_error);
+    return FALSE;
+  }
+  g_free(validation_error);
+  return TRUE;
 }
