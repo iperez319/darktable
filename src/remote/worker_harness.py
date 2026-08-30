@@ -510,6 +510,161 @@ def validate_surface(
     return hashlib.sha256(encoded_counts).hexdigest()
 
 
+def apply_and_render_state(
+    process: subprocess.Popen,
+    session_id: str,
+    state: dict,
+    generation: int,
+    width: int,
+    height: int,
+) -> tuple[dict, bytes]:
+    assert process.stdin is not None and process.stdout is not None
+    write_frame(
+        process.stdin,
+        SET_STATE,
+        envelope(
+            "session.setState",
+            str(uuid.uuid4()),
+            session_id,
+            {"generation": generation, "state": state},
+        ),
+    )
+    accepted, attachment = read_frame(process.stdout, STATE_ACCEPTED)
+    if attachment:
+        raise RuntimeError("state acceptance unexpectedly carried an attachment")
+    revision = int(accepted["body"]["revision"])
+    write_frame(
+        process.stdin,
+        RENDER,
+        envelope(
+            "surface.render",
+            str(uuid.uuid4()),
+            session_id,
+            {
+                "generation": generation,
+                "revision": revision,
+                "role": "overview",
+                "normalizedRect": {"x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0},
+                "sourcePixelsPerOutputPixel": 1.0,
+                "overscanPixels": 0,
+                "width": width,
+                "height": height,
+            },
+        ),
+    )
+    rendered, pixels = read_frame(process.stdout, RENDERED)
+    validate_surface(rendered, pixels, generation, revision, False)
+    return rendered, pixels
+
+
+def validate_local_mask_spatial_effect(
+    baseline: bytes,
+    masked: bytes,
+    width: int,
+    height: int,
+) -> None:
+    if len(baseline) != len(masked) or len(masked) != width * height * 4:
+        raise RuntimeError("local-mask locality surfaces have incompatible dimensions")
+
+    def region_differences(x0: float, y0: float, x1: float, y1: float) -> list[int]:
+        differences: list[int] = []
+        for y in range(int(height * y0), max(int(height * y0) + 1, int(height * y1))):
+            for x in range(int(width * x0), max(int(width * x0) + 1, int(width * x1))):
+                offset = (y * width + x) * 4
+                differences.extend(
+                    abs(baseline[offset + channel] - masked[offset + channel])
+                    for channel in range(3)
+                )
+        return differences
+
+    inside = region_differences(0.43, 0.43, 0.57, 0.57)
+    outside = []
+    for bounds in (
+        (0.0, 0.0, 0.12, 0.12),
+        (0.88, 0.0, 1.0, 0.12),
+        (0.0, 0.88, 0.12, 1.0),
+        (0.88, 0.88, 1.0, 1.0),
+    ):
+        outside.extend(region_differences(*bounds))
+
+    inside_mean = statistics.fmean(inside)
+    outside_mean = statistics.fmean(outside)
+    outside_changed_fraction = sum(delta != 0 for delta in outside) / len(outside)
+    if inside_mean < 1.0:
+        raise RuntimeError(
+            "local exposure produced no measurable effect inside its ellipse "
+            f"(mean color-byte delta {inside_mean:.3f})"
+        )
+    if outside_mean > max(0.25, inside_mean * 0.05) or outside_changed_fraction > 0.05:
+        raise RuntimeError(
+            "local exposure escaped its ellipse: "
+            f"inside mean delta {inside_mean:.3f}, outside mean delta {outside_mean:.3f}, "
+            f"outside changed fraction {outside_changed_fraction:.3%}"
+        )
+
+
+def validate_mask_spatial_probes(
+    baseline: bytes,
+    masked: bytes,
+    width: int,
+    height: int,
+    changed_probes: list[tuple[float, float]],
+    unchanged_probes: list[tuple[float, float]],
+    label: str,
+) -> None:
+    """Require a local adjustment at precise displayed-image coordinates."""
+    if len(baseline) != len(masked) or len(masked) != width * height * 4:
+        raise RuntimeError(f"{label} spatial surfaces have incompatible dimensions")
+
+    def mean_delta(point: tuple[float, float]) -> float:
+        center_x = round(point[0] * (width - 1))
+        center_y = round(point[1] * (height - 1))
+        radius = max(1, round(min(width, height) * 0.008))
+        differences: list[int] = []
+        for y in range(max(0, center_y - radius), min(height, center_y + radius + 1)):
+            for x in range(max(0, center_x - radius), min(width, center_x + radius + 1)):
+                offset = (y * width + x) * 4
+                differences.extend(
+                    abs(baseline[offset + channel] - masked[offset + channel])
+                    for channel in range(3)
+                )
+        return statistics.fmean(differences)
+
+    changed = [mean_delta(point) for point in changed_probes]
+    unchanged = [mean_delta(point) for point in unchanged_probes]
+    if min(changed) < 0.5:
+        raise RuntimeError(
+            f"{label} missed an expected overlay location; probe deltas={changed}"
+        )
+    if max(unchanged) > max(0.25, min(changed) * 0.08):
+        raise RuntimeError(
+            f"{label} affected a location outside its overlay; "
+            f"changed probe deltas={changed}, unchanged probe deltas={unchanged}"
+        )
+
+
+def local_exposure_mask(component: dict, identifier: str) -> dict:
+    return {
+        "id": f"{identifier}-mask",
+        "name": f"{identifier} spatial regression",
+        "enabled": True,
+        "inverted": False,
+        "opacity": 1.0,
+        "components": [component],
+        "range": None,
+        "adjustments": {
+            "exposureEV": 3.0,
+            "contrast": 0.0,
+            "highlights": 0.0,
+            "shadows": 0.0,
+            "whites": 0.0,
+            "blacks": 0.0,
+            "vibrance": 0.0,
+            "saturation": 0.0,
+        },
+    }
+
+
 def rgb_sha256(pixels: bytes) -> str:
     rgb = bytearray((len(pixels) // 4) * 3)
     rgb[0::3] = pixels[2::4]
@@ -1001,7 +1156,13 @@ def run(args: argparse.Namespace) -> int:
                 or overview_body["pixelFormat"] != viewport_body["pixelFormat"]
             ):
                 raise RuntimeError(
-                    "overview/viewport state, geometry, or output contract does not match"
+                    "overview/viewport state, geometry, or output contract does not match: "
+                    f"overview={{width: {overview_body['width']}, height: {overview_body['height']}, "
+                    f"state: {overview_body['stateDigest']}, stack: {overview_body['moduleStackDigest']}, "
+                    f"format: {overview_body['pixelFormat']}}}; "
+                    f"viewport={{width: {viewport_body['width']}, height: {viewport_body['height']}, "
+                    f"state: {viewport_body['stateDigest']}, stack: {viewport_body['moduleStackDigest']}, "
+                    f"format: {viewport_body['pixelFormat']}}}"
                 )
             overview_viewport_absolute = [
                 abs(left - right)
@@ -1230,6 +1391,248 @@ def run(args: argparse.Namespace) -> int:
             read_error(process.stdout, "invalid_state")
 
             next_state_generation = state_generation + 1
+            locality_baseline = json.loads(json.dumps(baseline_state))
+            locality_baseline["masks"] = []
+            _, locality_baseline_pixels = apply_and_render_state(
+                process,
+                session_id,
+                locality_baseline,
+                next_state_generation,
+                args.width,
+                args.height,
+            )
+            next_state_generation += 1
+            locality_masked = json.loads(json.dumps(locality_baseline))
+            locality_masked["masks"] = [
+                {
+                    "id": "locality-ellipse-mask",
+                    "name": "Locality regression",
+                    "enabled": True,
+                    "inverted": False,
+                    "opacity": 1.0,
+                    "components": [
+                        {
+                            "id": "locality-ellipse",
+                            "enabled": True,
+                            "inverted": False,
+                            "operation": "add",
+                            "kind": "ellipse",
+                            "gradient": None,
+                            "ellipse": {
+                                "center": {"x": 0.5, "y": 0.5},
+                                "radiusX": 0.22,
+                                "radiusY": 0.22,
+                                "rotationDegrees": 0.0,
+                                "feather": 0.08,
+                            },
+                            "brush": None,
+                        }
+                    ],
+                    "range": None,
+                    "adjustments": {
+                        "exposureEV": 3.0,
+                        "contrast": 0.0,
+                        "highlights": 0.0,
+                        "shadows": 0.0,
+                        "whites": 0.0,
+                        "blacks": 0.0,
+                        "vibrance": 0.0,
+                        "saturation": 0.0,
+                    },
+                }
+            ]
+            locality_render, locality_masked_pixels = apply_and_render_state(
+                process,
+                session_id,
+                locality_masked,
+                next_state_generation,
+                args.width,
+                args.height,
+            )
+            validate_local_mask_spatial_effect(
+                locality_baseline_pixels,
+                locality_masked_pixels,
+                int(locality_render["body"]["width"]),
+                int(locality_render["body"]["height"]),
+            )
+            next_state_generation += 1
+
+            # Verify canonical overlay coordinates through crop, straighten,
+            # flip, and quarter-turn before reaching darktable raw mask forms.
+            crop = {"x": 0.1, "y": 0.1, "width": 0.8, "height": 0.8}
+            spatial_baseline = json.loads(json.dumps(locality_baseline))
+            spatial_baseline["geometry"] = {
+                "crop": crop,
+                "rotationQuarterTurns": 1,
+                "straightenDegrees": 1.5,
+                "flipHorizontal": True,
+                "flipVertical": False,
+            }
+            spatial_baseline["masks"] = []
+            _, spatial_baseline_pixels = apply_and_render_state(
+                process,
+                session_id,
+                spatial_baseline,
+                next_state_generation,
+                args.width,
+                args.height,
+            )
+            next_state_generation += 1
+
+            def displayed(point: tuple[float, float]) -> tuple[float, float]:
+                return (
+                    (point[0] - crop["x"]) / crop["width"],
+                    (point[1] - crop["y"]) / crop["height"],
+                )
+
+            gradient_state = json.loads(json.dumps(spatial_baseline))
+            gradient_state["masks"] = [local_exposure_mask(
+                {
+                    "id": "spatial-gradient",
+                    "enabled": True,
+                    "inverted": False,
+                    "operation": "add",
+                    "kind": "linearGradient",
+                    "gradient": {
+                        "start": {"x": 0.5, "y": 0.5},
+                        "end": {"x": 0.75, "y": 0.5},
+                        "feather": 0.5,
+                    },
+                    "ellipse": None,
+                    "brush": None,
+                },
+                "gradient",
+            )]
+            gradient_render, gradient_pixels = apply_and_render_state(
+                process,
+                session_id,
+                gradient_state,
+                next_state_generation,
+                args.width,
+                args.height,
+            )
+            validate_mask_spatial_probes(
+                spatial_baseline_pixels,
+                gradient_pixels,
+                int(gradient_render["body"]["width"]),
+                int(gradient_render["body"]["height"]),
+                [displayed((0.75, 0.5))],
+                [displayed((0.25, 0.5))],
+                "linear gradient",
+            )
+            next_state_generation += 1
+
+            # Ellipse angles and radii are pixel-space quantities relative to
+            # the shorter side, not angles in a normalized-coordinate square.
+            full_width = float(source_dimensions[1])
+            full_height = float(source_dimensions[0])
+            shorter = min(full_width, full_height)
+            center = (0.5, 0.5)
+            angle = math.radians(32.0)
+            probe_radius = 0.11
+            major_delta = (
+                probe_radius * shorter / full_width * math.cos(angle),
+                probe_radius * shorter / full_height * math.sin(angle),
+            )
+            minor_delta = (
+                -probe_radius * shorter / full_width * math.sin(angle),
+                probe_radius * shorter / full_height * math.cos(angle),
+            )
+            ellipse_state = json.loads(json.dumps(spatial_baseline))
+            ellipse_state["masks"] = [local_exposure_mask(
+                {
+                    "id": "spatial-ellipse",
+                    "enabled": True,
+                    "inverted": False,
+                    "operation": "add",
+                    "kind": "ellipse",
+                    "gradient": None,
+                    "ellipse": {
+                        "center": {"x": center[0], "y": center[1]},
+                        "radiusX": 0.18,
+                        "radiusY": 0.045,
+                        "rotationDegrees": 32.0,
+                        "feather": 0.08,
+                    },
+                    "brush": None,
+                },
+                "ellipse",
+            )]
+            ellipse_render, ellipse_pixels = apply_and_render_state(
+                process,
+                session_id,
+                ellipse_state,
+                next_state_generation,
+                args.width,
+                args.height,
+            )
+            validate_mask_spatial_probes(
+                spatial_baseline_pixels,
+                ellipse_pixels,
+                int(ellipse_render["body"]["width"]),
+                int(ellipse_render["body"]["height"]),
+                [
+                    displayed(center),
+                    displayed((center[0] + major_delta[0], center[1] + major_delta[1])),
+                    displayed((center[0] - major_delta[0], center[1] - major_delta[1])),
+                ],
+                [
+                    displayed((center[0] + minor_delta[0], center[1] + minor_delta[1])),
+                    displayed((center[0] - minor_delta[0], center[1] - minor_delta[1])),
+                ],
+                "rotated ellipse",
+            )
+            next_state_generation += 1
+
+            brush_state = json.loads(json.dumps(spatial_baseline))
+            brush_state["masks"] = [local_exposure_mask(
+                {
+                    "id": "spatial-brush",
+                    "enabled": True,
+                    "inverted": False,
+                    "operation": "add",
+                    "kind": "brush",
+                    "gradient": None,
+                    "ellipse": None,
+                    "brush": {
+                        "strokes": [{
+                            "id": "spatial-stroke",
+                            "points": [
+                                {
+                                    "x": 0.38, "y": 0.45, "radius": 0.018,
+                                    "hardness": 1.0, "opacity": 1.0,
+                                    "pressure": 1.0, "elapsedMilliseconds": 0,
+                                },
+                                {
+                                    "x": 0.62, "y": 0.55, "radius": 0.018,
+                                    "hardness": 1.0, "opacity": 1.0,
+                                    "pressure": 1.0, "elapsedMilliseconds": 20,
+                                },
+                            ],
+                        }]
+                    },
+                },
+                "brush",
+            )]
+            brush_render, brush_pixels = apply_and_render_state(
+                process,
+                session_id,
+                brush_state,
+                next_state_generation,
+                args.width,
+                args.height,
+            )
+            validate_mask_spatial_probes(
+                spatial_baseline_pixels,
+                brush_pixels,
+                int(brush_render["body"]["width"]),
+                int(brush_render["body"]["height"]),
+                [displayed((0.38, 0.45)), displayed((0.5, 0.5)), displayed((0.62, 0.55))],
+                [displayed((0.38, 0.58)), displayed((0.62, 0.42))],
+                "brush stroke",
+            )
+            next_state_generation += 1
+
             for temperature, tint in ((1901.0, -100.0), (25000.0, 100.0)):
                 boundary_state = json.loads(json.dumps(state_fixture))
                 boundary_state["whiteBalance"]["temperatureKelvin"] = temperature

@@ -616,7 +616,7 @@ static JsonNode *_capabilities(JsonObject *request)
   ADD_MODULE("highlightReconstruction", "highlights", 4,
              "named product option -> pinned reconstruction mode");
   ADD_MODULE("maskLocalAdjustments", "colorbalancergb", 5,
-             "one duplicated instance per mask; gradient/ellipse/brush drawn forms plus range");
+             "masked exposure v7 plus color balance RGB v5 instances per mask; gradient/ellipse/brush drawn forms plus range");
 #undef ADD_MODULE
   json_object_set_object_member(editor_state, "modules", modules);
   JsonObject *ranges = json_object_new();

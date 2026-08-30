@@ -145,6 +145,7 @@ typedef struct dt_remote_editor_state_facade_t
   double xyz_to_cam[4][3];
   double cam_to_xyz[3][4];
   int base_orientation;
+  GPtrArray *mask_exposure_modules;
   GPtrArray *mask_modules;
   gboolean initialized;
 } dt_remote_editor_state_facade_t;

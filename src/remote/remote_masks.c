@@ -54,7 +54,64 @@ static void _free_forms(GList *forms)
   g_list_free_full(forms, (GDestroyNotify)dt_masks_free_form);
 }
 
-static dt_masks_form_t *_gradient_form(JsonObject *geometry)
+typedef struct dt_remote_mask_transform_t
+{
+  dt_develop_t *dev;
+  dt_dev_pixelpipe_t *pipe;
+  double display_width;
+  double display_height;
+  double input_width;
+  double input_height;
+  double crop_x;
+  double crop_y;
+  double crop_width;
+  double crop_height;
+} dt_remote_mask_transform_t;
+
+static gboolean _backtransform_points(const dt_remote_mask_transform_t *transform,
+                                      float *points,
+                                      size_t count)
+{
+  if(!transform) return TRUE;
+  if(!transform->dev || !transform->pipe
+     || transform->display_width <= 0.0 || transform->display_height <= 0.0
+     || transform->input_width <= 0.0 || transform->input_height <= 0.0
+     || transform->crop_width <= 0.0 || transform->crop_height <= 0.0)
+    return FALSE;
+  for(size_t index = 0; index < count; index++)
+  {
+    points[2 * index] = (float)((points[2 * index] - transform->crop_x)
+                                / transform->crop_width * transform->display_width);
+    points[2 * index + 1] = (float)((points[2 * index + 1] - transform->crop_y)
+                                    / transform->crop_height * transform->display_height);
+  }
+  if(!dt_dev_distort_backtransform_plus(transform->dev, transform->pipe, 0.0,
+                                        DT_DEV_TRANSFORM_DIR_ALL, points, count))
+    return FALSE;
+  for(size_t index = 0; index < count * 2; index++)
+    if(!isfinite(points[index])) return FALSE;
+  return TRUE;
+}
+
+static double _full_display_width(const dt_remote_mask_transform_t *transform)
+{
+  return transform->display_width / transform->crop_width;
+}
+
+static double _full_display_height(const dt_remote_mask_transform_t *transform)
+{
+  return transform->display_height / transform->crop_height;
+}
+
+static float _normalized_degrees(double degrees)
+{
+  while(degrees > 180.0) degrees -= 360.0;
+  while(degrees < -180.0) degrees += 360.0;
+  return (float)degrees;
+}
+
+static dt_masks_form_t *_gradient_form(JsonObject *geometry,
+                                       const dt_remote_mask_transform_t *transform)
 {
   JsonObject *start = json_object_get_object_member(geometry, "start");
   JsonObject *end = json_object_get_object_member(geometry, "end");
@@ -62,9 +119,24 @@ static dt_masks_form_t *_gradient_form(JsonObject *geometry)
   double feather = 0.0;
   if(!_point(start, p0) || !_point(end, p1) || !_double(geometry, "feather", &feather))
     return NULL;
-  const double dx = p1[0] - p0[0], dy = p1[1] - p0[1];
+  if(feather < 0.0 || feather > 1.0)
+    return NULL;
+
+  float points[6] = {
+    p0[0], p0[1], p1[0], p1[1],
+    (float)(p0[0] + (p1[0] - p0[0]) * feather),
+    (float)(p0[1] + (p1[1] - p0[1]) * feather)
+  };
+  if(!_backtransform_points(transform, points, 3)) return NULL;
+  const double width = transform ? transform->input_width : 1.0;
+  const double height = transform ? transform->input_height : 1.0;
+  const double dx = points[2] - points[0];
+  const double dy = points[3] - points[1];
+  const double feather_dx = points[4] - points[0];
+  const double feather_dy = points[5] - points[1];
   const double length = hypot(dx, dy);
-  if(length <= 0.000001 || feather < 0.0 || feather > 1.0) return NULL;
+  const double diagonal = hypot(width, height);
+  if(length <= 0.000001 || diagonal <= 0.0) return NULL;
   dt_masks_form_t *form = dt_masks_create(DT_MASKS_GRADIENT);
   if(!form) return NULL;
   dt_masks_point_gradient_t *point = calloc(1, sizeof(*point));
@@ -73,10 +145,14 @@ static dt_masks_form_t *_gradient_form(JsonObject *geometry)
     dt_masks_free_form(form);
     return NULL;
   }
-  point->anchor[0] = p0[0];
-  point->anchor[1] = p0[1];
-  point->rotation = (float)(atan2(dy, dx) * 180.0 / M_PI - 90.0);
-  point->compression = (float)MAX(0.001, length * MAX(0.001, feather));
+  point->anchor[0] = (float)(points[0] / width);
+  point->anchor[1] = (float)(points[1] / height);
+  // Canonical start->end is the fade axis in oriented image space. darktable
+  // stores the rotation of the perpendicular boundary and measures gradient
+  // compression as a fraction of the image diagonal. Derive both in pixels so
+  // non-square images preserve the iPad overlay's angle and feather location.
+  point->rotation = _normalized_degrees(-atan2(dy, dx) * 180.0 / M_PI - 90.0);
+  point->compression = (float)MAX(0.001, hypot(feather_dx, feather_dy) / diagonal);
   point->steepness = 0.0f;
   point->curvature = 0.0f;
   point->state = DT_MASKS_GRADIENT_STATE_LINEAR;
@@ -84,7 +160,8 @@ static dt_masks_form_t *_gradient_form(JsonObject *geometry)
   return form;
 }
 
-static dt_masks_form_t *_ellipse_form(JsonObject *geometry)
+static dt_masks_form_t *_ellipse_form(JsonObject *geometry,
+                                      const dt_remote_mask_transform_t *transform)
 {
   JsonObject *center = json_object_get_object_member(geometry, "center");
   float p[2];
@@ -104,24 +181,82 @@ static dt_masks_form_t *_ellipse_form(JsonObject *geometry)
     dt_masks_free_form(form);
     return NULL;
   }
-  point->center[0] = p[0];
-  point->center[1] = p[1];
-  point->radius[0] = (float)rx;
-  point->radius[1] = (float)ry;
-  point->rotation = (float)rotation;
-  point->border = (float)(MAX(rx, ry) * feather);
+  if(transform)
+  {
+    const double full_width = _full_display_width(transform);
+    const double full_height = _full_display_height(transform);
+    const double shorter = MIN(full_width, full_height);
+    const double angle = rotation * M_PI / 180.0;
+    const double axis_x_x = cos(angle) * rx * shorter / full_width;
+    const double axis_x_y = sin(angle) * rx * shorter / full_height;
+    const double axis_y_x = -sin(angle) * ry * shorter / full_width;
+    const double axis_y_y = cos(angle) * ry * shorter / full_height;
+    float points[6] = {
+      p[0], p[1],
+      (float)(p[0] + axis_x_x), (float)(p[1] + axis_x_y),
+      (float)(p[0] + axis_y_x), (float)(p[1] + axis_y_y)
+    };
+    if(!_backtransform_points(transform, points, 3))
+    {
+      dt_masks_free_form(form);
+      free(point);
+      return NULL;
+    }
+
+    const double ax = points[2] - points[0];
+    const double ay = points[3] - points[1];
+    const double bx = points[4] - points[0];
+    const double by = points[5] - points[1];
+    const double covariance_xx = ax * ax + bx * bx;
+    const double covariance_xy = ax * ay + bx * by;
+    const double covariance_yy = ay * ay + by * by;
+    const double trace = covariance_xx + covariance_yy;
+    const double discriminant = hypot(covariance_xx - covariance_yy,
+                                      2.0 * covariance_xy);
+    const double major = sqrt(MAX(0.0, 0.5 * (trace + discriminant)));
+    const double minor = sqrt(MAX(0.0, 0.5 * (trace - discriminant)));
+    const double shorter_input = MIN(transform->input_width, transform->input_height);
+    const double raw_rotation = 0.5 * atan2(2.0 * covariance_xy,
+                                            covariance_xx - covariance_yy);
+    point->center[0] = (float)(points[0] / transform->input_width);
+    point->center[1] = (float)(points[1] / transform->input_height);
+    point->radius[0] = (float)(major / shorter_input);
+    point->radius[1] = (float)(minor / shorter_input);
+    point->rotation = _normalized_degrees(raw_rotation * 180.0 / M_PI);
+    point->border = (float)(major / shorter_input * feather);
+  }
+  else
+  {
+    point->center[0] = p[0];
+    point->center[1] = p[1];
+    point->radius[0] = (float)rx;
+    point->radius[1] = (float)ry;
+    point->rotation = (float)rotation;
+    point->border = (float)(MAX(rx, ry) * feather);
+  }
   point->flags = DT_MASKS_ELLIPSE_EQUIDISTANT;
   form->points = g_list_append(form->points, point);
   return form;
 }
 
-static dt_masks_form_t *_brush_stroke_form(JsonObject *stroke)
+static dt_masks_form_t *_brush_stroke_form(JsonObject *stroke,
+                                           const dt_remote_mask_transform_t *transform)
 {
   JsonArray *points = json_object_get_array_member(stroke, "points");
   if(!points || json_array_get_length(points) == 0) return NULL;
   dt_masks_form_t *form = dt_masks_create(DT_MASKS_BRUSH);
   if(!form) return NULL;
-  for(guint index = 0; index < json_array_get_length(points); index++)
+  const guint count = json_array_get_length(points);
+  float *transformed = transform ? g_try_new(float, (size_t)count * 6) : NULL;
+  if(transform && !transformed)
+  {
+    dt_masks_free_form(form);
+    return NULL;
+  }
+  const double full_width = transform ? _full_display_width(transform) : 1.0;
+  const double full_height = transform ? _full_display_height(transform) : 1.0;
+  const double shorter = MIN(full_width, full_height);
+  for(guint index = 0; index < count; index++)
   {
     JsonObject *source = json_array_get_object_element(points, index);
     float p[2];
@@ -132,12 +267,14 @@ static dt_masks_form_t *_brush_stroke_form(JsonObject *stroke)
        || radius < 0.001 || radius > 0.5 || hardness < 0.0 || hardness > 1.0
        || opacity < 0.0 || opacity > 1.0)
     {
+      g_free(transformed);
       dt_masks_free_form(form);
       return NULL;
     }
     dt_masks_point_brush_t *point = calloc(1, sizeof(*point));
     if(!point)
     {
+      g_free(transformed);
       dt_masks_free_form(form);
       return NULL;
     }
@@ -148,6 +285,40 @@ static dt_masks_form_t *_brush_stroke_form(JsonObject *stroke)
     point->density = (float)opacity;
     point->state = DT_MASKS_POINT_STATE_USER;
     form->points = g_list_append(form->points, point);
+    if(transform)
+    {
+      transformed[6 * index] = p[0];
+      transformed[6 * index + 1] = p[1];
+      transformed[6 * index + 2] = (float)(p[0] + radius * shorter / full_width);
+      transformed[6 * index + 3] = p[1];
+      transformed[6 * index + 4] = p[0];
+      transformed[6 * index + 5] = (float)(p[1] + radius * shorter / full_height);
+    }
+  }
+  if(transform)
+  {
+    if(!_backtransform_points(transform, transformed, (size_t)count * 3))
+    {
+      g_free(transformed);
+      dt_masks_free_form(form);
+      return NULL;
+    }
+    const double shorter_input = MIN(transform->input_width, transform->input_height);
+    guint index = 0;
+    for(GList *node = form->points; node; node = g_list_next(node), index++)
+    {
+      dt_masks_point_brush_t *point = node->data;
+      const float *sample = transformed + 6 * index;
+      const double radius_x = hypot(sample[2] - sample[0], sample[3] - sample[1]);
+      const double radius_y = hypot(sample[4] - sample[0], sample[5] - sample[1]);
+      const float raw_radius = (float)(0.5 * (radius_x + radius_y) / shorter_input);
+      point->corner[0] = point->ctrl1[0] = point->ctrl2[0] =
+        (float)(sample[0] / transform->input_width);
+      point->corner[1] = point->ctrl1[1] = point->ctrl2[1] =
+        (float)(sample[1] / transform->input_height);
+      point->border[0] = point->border[1] = raw_radius;
+    }
+    g_free(transformed);
   }
   return form;
 }
@@ -184,7 +355,10 @@ static gboolean _append_shape(dt_masks_form_t *group, dt_masks_form_t *shape,
   return TRUE;
 }
 
-static gboolean _component_forms(JsonObject *component, dt_masks_form_t *group, GList **forms)
+static gboolean _component_forms(JsonObject *component,
+                                 dt_masks_form_t *group,
+                                 GList **forms,
+                                 const dt_remote_mask_transform_t *transform)
 {
   if(!component) return FALSE;
   const gboolean enabled =
@@ -197,13 +371,17 @@ static gboolean _component_forms(JsonObject *component, dt_masks_form_t *group, 
   const gboolean inverted =
     json_object_get_boolean_member_with_default(component, "inverted", FALSE);
   if(!g_strcmp0(kind, "linearGradient"))
-    return _append_shape(group,
-                         _gradient_form(json_object_get_object_member(component, "gradient")),
-                         operation, inverted, enabled, forms);
+  {
+    dt_masks_form_t *shape =
+      _gradient_form(json_object_get_object_member(component, "gradient"), transform);
+    return _append_shape(group, shape, operation, inverted, enabled, forms);
+  }
   if(!g_strcmp0(kind, "ellipse"))
-    return _append_shape(group,
-                         _ellipse_form(json_object_get_object_member(component, "ellipse")),
-                         operation, inverted, enabled, forms);
+  {
+    dt_masks_form_t *shape =
+      _ellipse_form(json_object_get_object_member(component, "ellipse"), transform);
+    return _append_shape(group, shape, operation, inverted, enabled, forms);
+  }
   if(g_strcmp0(kind, "brush")) return FALSE;
   JsonObject *brush = json_object_get_object_member(component, "brush");
   JsonArray *strokes = brush ? json_object_get_array_member(brush, "strokes") : NULL;
@@ -212,9 +390,9 @@ static gboolean _component_forms(JsonObject *component, dt_masks_form_t *group, 
   if(!brush_group) return FALSE;
   for(guint index = 0; index < json_array_get_length(strokes); index++)
   {
-    if(!_append_shape(brush_group,
-                      _brush_stroke_form(json_array_get_object_element(strokes, index)),
-                      "add", FALSE, TRUE, forms))
+    dt_masks_form_t *shape =
+      _brush_stroke_form(json_array_get_object_element(strokes, index), transform);
+    if(!_append_shape(brush_group, shape, "add", FALSE, TRUE, forms))
     {
       dt_masks_free_form(brush_group);
       return FALSE;
@@ -266,7 +444,10 @@ static gboolean _mask_configuration_is_valid(JsonObject *mask)
   return TRUE;
 }
 
-static gboolean _build_forms(JsonArray *masks, GList **forms, GPtrArray *groups)
+static gboolean _build_forms(JsonArray *masks,
+                             GList **forms,
+                             GPtrArray *groups,
+                             const dt_remote_mask_transform_t *transform)
 {
   const guint count = json_array_get_length(masks);
   gboolean ok = TRUE;
@@ -277,9 +458,14 @@ static gboolean _build_forms(JsonArray *masks, GList **forms, GPtrArray *groups)
     if(!_mask_configuration_is_valid(mask) || !components
        || json_array_get_length(components) == 0
        || json_array_get_length(components) > DT_REMOTE_MAX_MASK_COMPONENTS)
+    {
       return FALSE;
+    }
     dt_masks_form_t *group = dt_masks_create(DT_MASKS_GROUP);
-    if(!group) return FALSE;
+    if(!group)
+    {
+      return FALSE;
+    }
     const char *name = json_object_get_string_member(mask, "name");
     g_strlcpy(group->name, name, sizeof(group->name));
     *forms = g_list_append(*forms, group);
@@ -287,8 +473,11 @@ static gboolean _build_forms(JsonArray *masks, GList **forms, GPtrArray *groups)
     for(guint component_index = 0;
         ok && component_index < json_array_get_length(components); component_index++)
       ok = _component_forms(json_array_get_object_element(components, component_index),
-                            group, forms);
-    if(!group->points) ok = FALSE;
+                            group, forms, transform);
+    if(!group->points)
+    {
+      ok = FALSE;
+    }
   }
   return ok;
 }
@@ -309,7 +498,8 @@ gboolean dt_remote_masks_validate(const char *masks_json, char **error)
   const guint count = masks ? json_array_get_length(masks) : DT_REMOTE_MAX_MASKS + 1;
   GList *forms = NULL;
   GPtrArray *groups = g_ptr_array_new();
-  const gboolean ok = count <= DT_REMOTE_MAX_MASKS && _build_forms(masks, &forms, groups);
+  const gboolean ok = count <= DT_REMOTE_MAX_MASKS
+                      && _build_forms(masks, &forms, groups, NULL);
   if(!ok) _set_error(error, "mask state could not be normalized for darktable");
   _free_forms(forms);
   g_ptr_array_free(groups, TRUE);
@@ -317,21 +507,23 @@ gboolean dt_remote_masks_validate(const char *masks_json, char **error)
   return ok;
 }
 
-static dt_iop_module_t *_module_for_mask(dt_remote_editor_state_facade_t *facade,
-                                         dt_develop_t *dev, guint index)
+static dt_iop_module_t *_module_for_mask(GPtrArray **modules,
+                                         dt_develop_t *dev,
+                                         dt_iop_module_t *base,
+                                         guint index)
 {
-  if(!facade->mask_modules)
-    facade->mask_modules = g_ptr_array_new();
-  while(facade->mask_modules->len <= index)
+  if(!*modules)
+    *modules = g_ptr_array_new();
+  while((*modules)->len <= index)
   {
-    dt_iop_module_t *module = dt_dev_module_duplicate(dev, facade->color_balance.module);
+    dt_iop_module_t *module = dt_dev_module_duplicate(dev, base);
     if(!module) return NULL;
-    g_ptr_array_add(facade->mask_modules, module);
+    g_ptr_array_add(*modules, module);
     // A duplicate changes the pixelpipe topology. Synchronizing parameters is
     // insufficient until the pipe is rebuilt with the new instance.
     dt_dev_pixelpipe_rebuild(dev);
   }
-  return g_ptr_array_index(facade->mask_modules, index);
+  return g_ptr_array_index(*modules, index);
 }
 
 static gboolean _write_float(dt_iop_module_t *module, uint8_t *params,
@@ -357,8 +549,94 @@ static int _parametric_channel(const char *channel)
   return DEVELOP_BLENDIF_GRAY_in;
 }
 
-static gboolean _configure_module(dt_iop_module_t *module, JsonObject *mask,
-                                  dt_mask_id_t group_id, char **error)
+static gboolean _configure_blend(dt_iop_module_t *module, JsonObject *mask,
+                                 dt_mask_id_t group_id,
+                                 dt_develop_blend_params_t *blend,
+                                 char **error)
+{
+  *blend = *module->default_blendop_params;
+  // DEVELOP_MASK_ENABLED is the gate checked by the pixelpipe before it calls
+  // the blend stage. Setting only DEVELOP_MASK_MASK leaves the module's
+  // processed output unblended, which makes a supposedly local edit global.
+  blend->mask_mode = DEVELOP_MASK_ENABLED | DEVELOP_MASK_MASK;
+  blend->mask_id = group_id;
+  blend->blend_mode = DEVELOP_BLEND_NORMAL2;
+  blend->opacity = (float)(100.0 * json_object_get_double_member(mask, "opacity"));
+  if(json_object_get_boolean_member_with_default(mask, "inverted", FALSE))
+    blend->mask_combine |= DEVELOP_COMBINE_MASKS_POS;
+  JsonObject *range = json_object_get_object_member(mask, "range");
+  if(range && json_object_get_boolean_member_with_default(range, "enabled", FALSE))
+  {
+    const int channel = _parametric_channel(json_object_get_string_member(range, "channel"));
+    JsonArray *handles = json_object_get_array_member(range, "handles");
+    if(!handles || json_array_get_length(handles) != 4)
+    {
+      _set_error(error, "mask parametric range must contain four handles");
+      return FALSE;
+    }
+    blend->mask_mode |= DEVELOP_MASK_CONDITIONAL;
+    blend->blendif |= (1u << DEVELOP_BLENDIF_active) | (1u << channel);
+    for(guint index = 0; index < 4; index++)
+      blend->blendif_parameters[4 * channel + index] =
+        (float)json_array_get_double_element(handles, index);
+    if(json_object_get_boolean_member_with_default(range, "inverted", FALSE))
+      blend->blendif |= (1u << (channel + 16));
+  }
+  return TRUE;
+}
+
+static void _install_module(dt_iop_module_t *module,
+                            const uint8_t *params,
+                            const dt_develop_blend_params_t *blend,
+                            const char *name,
+                            gboolean enabled)
+{
+  dt_pthread_mutex_lock(&module->dev->history_mutex);
+  memcpy(module->params, params, module->params_size);
+  memcpy(module->blend_params, blend, sizeof(*blend));
+  module->enabled = enabled;
+  g_strlcpy(module->multi_name, name ? name : "Remote mask", sizeof(module->multi_name));
+  module->multi_name_hand_edited = TRUE;
+  dt_dev_add_history_item_ext(module->dev, module, enabled, FALSE);
+  dt_dev_invalidate_all(module->dev);
+  dt_pthread_mutex_unlock(&module->dev->history_mutex);
+}
+
+static gboolean _configure_exposure_module(dt_iop_module_t *module, JsonObject *mask,
+                                            dt_mask_id_t group_id, char **error)
+{
+  uint8_t *params = g_try_malloc(module->params_size);
+  if(!params)
+  {
+    _set_error(error, "could not allocate local exposure parameters");
+    return FALSE;
+  }
+  memcpy(params, module->default_params, module->params_size);
+  JsonObject *adjustments = json_object_get_object_member(mask, "adjustments");
+  double exposure = 0.0;
+  const gboolean valid = adjustments
+    && _double(adjustments, "exposureEV", &exposure)
+    && _write_float(module, params, "exposure", exposure)
+    && _write_float(module, params, "black", 0.0);
+  dt_develop_blend_params_t blend;
+  if(!valid || !_configure_blend(module, mask, group_id, &blend, error))
+  {
+    g_free(params);
+    if(valid == FALSE) _set_error(error, "mask local exposure mapping is invalid");
+    return FALSE;
+  }
+
+  const gboolean mask_enabled =
+    json_object_get_boolean_member_with_default(mask, "enabled", TRUE);
+  _install_module(module, params, &blend,
+                  json_object_get_string_member(mask, "name"),
+                  mask_enabled && fabs(exposure) > 0.0000001);
+  g_free(params);
+  return TRUE;
+}
+
+static gboolean _configure_color_module(dt_iop_module_t *module, JsonObject *mask,
+                                        dt_mask_id_t group_id, char **error)
 {
   uint8_t *params = g_try_malloc(module->params_size);
   if(!params)
@@ -379,7 +657,6 @@ static gboolean _configure_module(dt_iop_module_t *module, JsonObject *mask,
     && _double(adjustments, "blacks", &blacks)
     && _double(adjustments, "vibrance", &vibrance)
     && _double(adjustments, "saturation", &saturation)
-    && _write_float(module, params, "global_Y", exposure / 5.0)
     && _write_float(module, params, "contrast", contrast / 100.0)
     && _write_float(module, params, "highlights_Y", highlights / 100.0)
     && _write_float(module, params, "shadows_Y", shadows / 100.0)
@@ -394,51 +671,32 @@ static gboolean _configure_module(dt_iop_module_t *module, JsonObject *mask,
     return FALSE;
   }
 
-  dt_develop_blend_params_t blend = *module->default_blendop_params;
-  blend.mask_mode = DEVELOP_MASK_MASK;
-  blend.mask_id = group_id;
-  blend.blend_mode = DEVELOP_BLEND_NORMAL2;
-  blend.opacity = (float)(100.0 * json_object_get_double_member(mask, "opacity"));
-  if(json_object_get_boolean_member_with_default(mask, "inverted", FALSE))
-    blend.mask_combine = DEVELOP_COMBINE_INV_EXCL;
-  JsonObject *range = json_object_get_object_member(mask, "range");
-  if(range && json_object_get_boolean_member_with_default(range, "enabled", FALSE))
+  dt_develop_blend_params_t blend;
+  if(!_configure_blend(module, mask, group_id, &blend, error))
   {
-    const int channel = _parametric_channel(json_object_get_string_member(range, "channel"));
-    JsonArray *handles = json_object_get_array_member(range, "handles");
-    if(!handles || json_array_get_length(handles) != 4)
-    {
-      g_free(params);
-      _set_error(error, "mask parametric range must contain four handles");
-      return FALSE;
-    }
-    blend.mask_mode |= DEVELOP_MASK_CONDITIONAL;
-    blend.blendif |= (1u << DEVELOP_BLENDIF_active) | (1u << channel);
-    for(guint index = 0; index < 4; index++)
-      blend.blendif_parameters[4 * channel + index] =
-        (float)json_array_get_double_element(handles, index);
-    if(json_object_get_boolean_member_with_default(range, "inverted", FALSE))
-      blend.blendif |= (1u << (channel + 16));
+    g_free(params);
+    return FALSE;
   }
-
-  const gboolean enabled =
+  const gboolean mask_enabled =
     json_object_get_boolean_member_with_default(mask, "enabled", TRUE);
+  const gboolean has_color_adjustment =
+    fabs(contrast) > 0.0000001 || fabs(highlights) > 0.0000001
+    || fabs(shadows) > 0.0000001 || fabs(whites) > 0.0000001
+    || fabs(blacks) > 0.0000001 || fabs(vibrance) > 0.0000001
+    || fabs(saturation) > 0.0000001;
   const char *name = json_object_get_string_member(mask, "name");
-  dt_pthread_mutex_lock(&module->dev->history_mutex);
-  memcpy(module->params, params, module->params_size);
-  memcpy(module->blend_params, &blend, sizeof(blend));
-  module->enabled = enabled;
-  g_strlcpy(module->multi_name, name ? name : "Remote mask", sizeof(module->multi_name));
-  module->multi_name_hand_edited = TRUE;
-  dt_dev_add_history_item_ext(module->dev, module, module->enabled, FALSE);
-  dt_dev_invalidate_all(module->dev);
-  dt_pthread_mutex_unlock(&module->dev->history_mutex);
+  _install_module(module, params, &blend, name, mask_enabled && has_color_adjustment);
   g_free(params);
   return TRUE;
 }
 
 gboolean dt_remote_masks_apply(dt_remote_editor_state_facade_t *facade,
                                dt_develop_t *dev,
+                               dt_iop_module_t *exposure_module,
+                               double crop_x,
+                               double crop_y,
+                               double crop_width,
+                               double crop_height,
                                const char *masks_json,
                                char **error)
 {
@@ -463,7 +721,19 @@ gboolean dt_remote_masks_apply(dt_remote_editor_state_facade_t *facade,
 
   GList *forms = NULL;
   GPtrArray *groups = g_ptr_array_new();
-  gboolean ok = _build_forms(masks, &forms, groups);
+  const dt_remote_mask_transform_t transform = {
+    .dev = dev,
+    .pipe = dev->full.pipe,
+    .display_width = dev->full.pipe->processed_width,
+    .display_height = dev->full.pipe->processed_height,
+    .input_width = dev->full.pipe->iwidth,
+    .input_height = dev->full.pipe->iheight,
+    .crop_x = crop_x,
+    .crop_y = crop_y,
+    .crop_width = crop_width,
+    .crop_height = crop_height
+  };
+  gboolean ok = _build_forms(masks, &forms, groups, &transform);
   if(!ok)
   {
     _set_error(error, "mask geometry could not be normalized for darktable");
@@ -476,11 +746,23 @@ gboolean dt_remote_masks_apply(dt_remote_editor_state_facade_t *facade,
   dt_masks_replace_current_forms(dev, forms);
   for(guint index = 0; ok && index < count; index++)
   {
-    dt_iop_module_t *module = _module_for_mask(facade, dev, index);
+    dt_iop_module_t *local_exposure =
+      _module_for_mask(&facade->mask_exposure_modules, dev, exposure_module, index);
+    dt_iop_module_t *module =
+      _module_for_mask(&facade->mask_modules, dev, facade->color_balance.module, index);
     dt_masks_form_t *group = g_ptr_array_index(groups, index);
-    ok = module && _configure_module(module, json_array_get_object_element(masks, index),
-                                     group->formid, error);
+    JsonObject *mask = json_array_get_object_element(masks, index);
+    ok = local_exposure && module
+         && _configure_exposure_module(local_exposure, mask, group->formid, error)
+         && _configure_color_module(module, mask, group->formid, error);
   }
+  if(facade->mask_exposure_modules)
+    for(guint index = count; index < facade->mask_exposure_modules->len; index++)
+    {
+      dt_iop_module_t *module = g_ptr_array_index(facade->mask_exposure_modules, index);
+      module->enabled = FALSE;
+      dt_dev_add_history_item_ext(dev, module, FALSE, FALSE);
+    }
   if(facade->mask_modules)
     for(guint index = count; index < facade->mask_modules->len; index++)
     {
@@ -498,6 +780,9 @@ gboolean dt_remote_masks_apply(dt_remote_editor_state_facade_t *facade,
 
 void dt_remote_masks_cleanup(dt_remote_editor_state_facade_t *facade)
 {
+  if(facade->mask_exposure_modules)
+    g_ptr_array_free(facade->mask_exposure_modules, TRUE);
+  facade->mask_exposure_modules = NULL;
   if(facade->mask_modules)
     g_ptr_array_free(facade->mask_modules, TRUE);
   facade->mask_modules = NULL;

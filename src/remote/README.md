@@ -90,15 +90,19 @@ mapping names in `worker.capabilities.editorState`. The mappings are:
   off/low/medium/high presets canonicalize to 0/25/50/75.
 - Highlight reconstruction v4 maps the five named product choices to inpaint
   opposed, clip, reconstruct color, guided laplacians, or segmentation.
-- Conventional masks use darktable drawn-mask forms in oriented-normalized
-  coordinates. Linear gradients map to gradient forms, ellipses to ellipse
-  forms, and each brush stroke to a brush form inside a component group so
-  component-level inversion and add/subtract/intersect composition remain
-  ordered. Each canonical mask owns a duplicated Color Balance RGB v5 instance;
-  its opacity/inversion, drawn group, optional parametric channel/four-handle
-  range, and local Exposure/Light/Color controls are installed in blend and
-  module parameters. Creating an instance rebuilds the pixelpipe topology before
-  the first authoritative render.
+- Conventional masks use darktable drawn-mask forms. The client sends complete
+  oriented-image coordinates; the worker maps them through the active crop and
+  reverses darktable's full-resolution distortion pipeline before storing raw
+  form coordinates, matching native darktable mask creation. Linear gradients
+  map their fade axis to darktable boundary rotation/diagonal compression;
+  ellipses and brushes preserve darktable's shorter-image-dimension radius
+  convention. Each brush stroke becomes a brush form inside a component group,
+  so component-level inversion and add/subtract/intersect composition remain
+  ordered. Each canonical mask owns duplicated Exposure v7 and Color Balance
+  RGB v5 instances; opacity/inversion, the drawn group, optional parametric
+  channel/four-handle range, and local Exposure/Light/Color controls are
+  installed in native blend and module parameters. Creating an instance
+  rebuilds pixelpipe topology before the first authoritative render.
 
 AI object masks remain outside facade v3. Parameters in the pinned modules that
 are not product controls are copied from the session baseline.

@@ -15,6 +15,11 @@
 gboolean dt_remote_masks_validate(const char *masks_json, char **error);
 gboolean dt_remote_masks_apply(dt_remote_editor_state_facade_t *facade,
                                dt_develop_t *dev,
+                               dt_iop_module_t *exposure_module,
+                               double crop_x,
+                               double crop_y,
+                               double crop_width,
+                               double crop_height,
                                const char *masks_json,
                                char **error);
 void dt_remote_masks_cleanup(dt_remote_editor_state_facade_t *facade);

@@ -16,6 +16,7 @@
 #include "common/image.h"
 #include "common/introspection.h"
 #include "develop/imageop.h"
+#include "develop/pixelpipe_hb.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -932,7 +933,14 @@ gboolean dt_remote_editor_state_apply(dt_remote_editor_state_facade_t *facade,
   _install_module(&facade->highlight_reconstruction, dev, highlight_params,
                   facade->highlight_reconstruction.baseline_enabled);
 
-  if(!dt_remote_masks_apply(facade, dev, state->masks_json, error))
+  // darktable's interactive mask tools store points only after reversing the
+  // active pixelpipe geometry. Synchronize the full-resolution pipe used by
+  // remote rendering so the mask adapter performs that same back-transform.
+  dt_dev_pixelpipe_change(dev->full.pipe, dev);
+  if(!dt_remote_masks_apply(facade, dev, exposure->module,
+                            state->geometry.x, state->geometry.y,
+                            state->geometry.width, state->geometry.height,
+                            state->masks_json, error))
     goto failed;
 
   facade->current = *state;
